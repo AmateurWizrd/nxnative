@@ -85,6 +85,8 @@ t_timestamp: t_timestamp.c ../nvn/nvn_timestamp.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
 t_counter_clock: t_counter_clock.m ../../host/hle_os.c ../../host/dm.h $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_counter_clock.m ../../host/hle_os.c $(MTL_T_SRC) $(FW)
+t_poolpeak: t_poolpeak.c ../nvn/nvn_poolpeak.h
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
 t_fstep: t_fstep.c ../nvn/nvn_fstep.h
 	clang -O1 -Wall -o $@ t_fstep.c
 t_tables: t_tables.c ../nvn/nvn_tables.h
