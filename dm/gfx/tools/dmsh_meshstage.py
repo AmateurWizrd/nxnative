@@ -19,6 +19,8 @@ threadgroups (nvn_geometry.inc mtk_encode). The task and object functions read t
 """
 import re
 import struct
+import zlib
+from types import SimpleNamespace
 import dmsh_abi as abi
 
 WORKGROUP, INPUT = 0, 0x10
@@ -143,6 +145,76 @@ def _device(msl):   # twin of the rewrite at the end of dmsh_build.py tg_spill: 
     return '\n'.join(out)
 
 
+# nxnative: a raw global memory load, the helper the translator calls for a load through a pointer the shader read from memory (GlobalToStorage.TryGenerateRawStorageOp, the unresolved form: the
+# address, the pool table, the helper's last entry), as spirv-cross writes it: its name, the address words, the table's type and member, the last-entry variable, the 3-word result array of a
+# 128-bit load, and its body, which holds the 2 MiB chunk hint (>> uint(21))
+RAW_BAD_SHIFT, RAW_BAD_LIMIT, RAW_RETRY = 13, 8, 64   # the scratch word: the entry in its low 13 bits, above them a count of the groups that missed (15 at most); from RAW_BAD_LIMIT on a shader's groups run the exact body alone, and one group in RAW_RETRY tries again
+_RAW_LOAD = re.compile(r'^int (_\d+)\(thread const int& (\w+), thread const int& (\w+), const device (_\d+)& (cp_s\d+), thread uint& (\w+)(?:, thread spvUnsafeArray<uint, 3>& (\w+))?\)\n\{\n(.*?)^\}\n', re.M | re.S)
+
+
+def _raw_cache(src, names, mem):
+    """A mesh shader's raw global loads, branch-free. Each load checks its address against the pool table's entry and has branches around its lookup: the last entry's range (4 table reads), the
+    chunk hint, a search, the entry's delta (2 reads); with 134 such loads a thread (Ocarina of Time's foliage meshes 73dc0b90c4082e43, 4c7d6be5a7717c8d, eed1add7c89f5d34, 17c8ab6419068d4b) they
+    were 40-60 % of the body's time on an M3 Pro, branches and all (a load checked by a cached range and no branch: 1.85 -> 1.23 ms of 4,096 groups, to 0.72 with no check). Here the stage runs
+    first on one entry of the table held in registers, dm_c = {start, length, host address of the start}: a load inside it adds its offset, a load outside it reads the table's first word instead
+    and sets dm_miss, and the value is wrong. A group in which any lane missed (the whole SIMD-group agrees: 32 threads) runs again from the start with the exact lookup, the original body, and
+    leaves the entry its loads ended on in the scratch buffer's head word for its shader (dm_slot: any word is a real entry, so a stale or torn one only misses), where the next group takes
+    its entry from. A shader whose loads leave one pool misses every group and would cost the first run besides the second (+45 %): the word counts the groups that missed, a group that did not
+    takes one off, and from RAW_BAD_LIMIT misses on the exact body runs alone, one group in RAW_RETRY trying the fast one again. Only a stage that changes nothing outside its own memory can run twice:
+    no atomic, no write to a storage buffer, image or raw pointer, no other function with the lookup's shape. → (the source with dm_stage_body_f, the fast body, and dm_stage_body, the exact one
+    taking its last entries as parameters; the call of the fast one; block(...) the wrapper's code that runs them), or None"""
+    loads = [m for m in _RAW_LOAD.finditer(src) if 'uint(21)' in m[8]]
+    at = src.find('static inline __attribute__((always_inline)) void dm_stage_body(')
+    if not loads or at < 0: return None
+    head, body = src[:at], src[at:]
+    if len({(m[4], m[5]) for m in loads}) != 1 or re.search(r'atomic_|\.write\(|access::(?:write|read_write)|reinterpret_cast<device |(?:^|[;{])\s*device\s+\w+\*\s+\w+\s*\[\[id', head + body, re.M): return None
+    ty, cp = loads[0][4], loads[0][5]
+    fast = ''
+    for m in loads:
+        name, lo, hi, _, _, _, out = m.groups()[:7]
+        load = (f'    uint4 v = *p;\n    {out}[0] = v.y; {out}[1] = v.z; {out}[2] = v.w;\n    return as_type<int>(v.x);\n' if out else '    uint v = *p;\n    return as_type<int>(v);\n')
+        kind = 'uint4' if out else 'uint'
+        fast += (f'static inline __attribute__((always_inline))\nint {name}_f(thread const int& {lo}, thread const int& {hi}, const device {ty}& {cp}, thread ulong3& dm_c, thread bool& dm_miss' +
+                 (f', thread spvUnsafeArray<uint, 3>& {out}' if out else '') + ')\n{\n'
+                 f'    ulong o = as_type<ulong>(uint2(uint({lo}), uint({hi}))) - dm_c.x;\n    bool hit = o < dm_c.y;\n    dm_miss = dm_miss || !hit;\n'
+                 f'    const device {kind}* p = hit ? reinterpret_cast<const device {kind}*>(dm_c.z + o) : reinterpret_cast<const device {kind}*>(&{cp}._m0[0]);\n{load}}}\n\n')
+    hints = [m[6] for m in loads]
+    fbody, calls, odd = body, 0, 0
+    for m in loads:
+        def one(c):
+            nonlocal calls, odd
+            a = _params(c[1]); calls += 1; odd += len(a) != (5 if m[7] else 4)   # the translator's calls pass plain names: any other shape is not one this reads
+            return f'{m[1]}_f({", ".join(a[:3] + ["dm_c", "dm_miss"] + a[4:])});'
+        fbody = re.sub(r'\b%s\(([^;]*)\);' % m[1], one, fbody)
+    if not calls or odd or any(re.search(r'\b%s\(' % m[1], fbody) for m in loads): return None
+    end = lambda s, extra: re.sub(r'\)\n\{\n', f', {extra})\n{{\n', s, count=1)
+    sbody = body
+    for h in hints:
+        sbody, n = re.subn(r'^[ \t]*uint %s = 0u;\n' % h, '', sbody, count=1, flags=re.M)
+        if n != 1: return None
+    fbody = end(fbody.replace('void dm_stage_body(', 'void dm_stage_body_f(', 1), 'thread ulong3& dm_c, thread bool& dm_miss')
+    sbody = end(sbody, ', '.join(f'thread uint& {h}' for h in hints))
+    entry = (f'static inline ulong3 dm_entry(const device {ty}& {cp}, uint e)\n{{\n    uint w = (e & 8191u) * 8u;\n'   # the table's 8,192 entries: a word of any value names a real one
+             f'    ulong s = as_type<ulong>(uint2({cp}._m0[w], {cp}._m0[w + 1u])), n = as_type<ulong>(uint2({cp}._m0[w + 2u], {cp}._m0[w + 3u])), d = as_type<ulong>(uint2({cp}._m0[w + 4u], {cp}._m0[w + 5u]));\n'
+             '    return ulong3(s, n - s, s + d);\n}\n\n')
+    slot = 1 + zlib.crc32(src.encode()) % (abi.MESH_SCRATCH_HEAD // 4 - 1)   # a word of the head after the ticket's: this shader's
+    table = re.search(r'\((\*\w+\.%s)\)' % cp, body)[1]   # the table as the calls name it: (*spvDescriptorSet0.cp_s3)
+
+    def block(names, mem, lid, tg, bar, zero, fill, call):
+        hs = ", ".join(f"dm_h{k}" for k in range(len(hints)))
+        fcall = call.replace("dm_stage_body(", "dm_stage_body_f(").replace(");", ", dm_c, dm_miss);")
+        return (f'    device uint* dm_slot = (device uint*)dm_scr + {slot};\n'
+                f'    uint dm_s = simd_broadcast_first(*dm_slot), dm_bad = dm_s >> {RAW_BAD_SHIFT} & 15u;\n'   # one value for the whole SIMD-group
+                f'    bool dm_try = dm_bad < {RAW_BAD_LIMIT}u || ({tg} & {RAW_RETRY - 1}u) == 0u, dm_miss = !dm_try;\n'
+                f'    ulong3 dm_c = dm_entry({table}, dm_s);\n    if (dm_try) {fcall}\n'
+                f'    if (!simd_any(dm_miss))\n    {{\n        if (dm_try && dm_bad != 0u && {lid} == 0u) *dm_slot = (dm_s & 8191u) | (dm_bad - 1u) << {RAW_BAD_SHIFT};\n    }}\n'
+                f'    else\n    {{\n        if (dm_try)\n        {{\n            threadgroup_barrier({bar});\n{zero}            threadgroup_barrier({bar});\n{fill}            threadgroup_barrier({bar});\n        }}\n'
+                f'        uint {", ".join(f"dm_h{k} = 0u" for k in range(len(hints)))};\n        {call.replace(");", ", " + hs + ");")}\n        threadgroup_barrier({bar});\n'
+                f'        uint dm_n = simd_max(max({hs}));\n'
+                f'        if (dm_try && {lid} == 0u) *dm_slot = (dm_n != 0u ? dm_n : dm_s & 8191u) | min(dm_bad + 1u, {RAW_BAD_LIMIT + 1}u) << {RAW_BAD_SHIFT};\n    }}\n')
+    return SimpleNamespace(src=head + fast + entry + fbody + '\n' + sbody, call=f'dm_stage_body({", ".join(names + [mem])});', block=block)
+
+
 def to_stage(msl, i, reads=None):
     """The translated kernel as the object function main0 (kind 'ts'), or the mesh functions main0 and main0_z (kind 'ms': the two depth conventions, as dmsh_build.py vs_depth gives a
     vertex shader, near = -w and near = 0). reads: {user(locnN) location: component mask} of what a mesh shader's paired pixel shaders read (pixel_reads), None when not known.
@@ -165,6 +237,8 @@ def to_stage(msl, i, reads=None):
         i['spill'] = 1   # the build writes the reflection's mesh_spill from it: the host binds the scratch buffer at abi.MESH_SCRATCH_SLOT
         src = _device(src)
     call = f'dm_stage_body({", ".join(names + [mem])});'
+    raw = _raw_cache(src, names, mem) if spill else None
+    if raw: src, call = raw.src, raw.call
     # The thread's and the threadgroup's numbers: the kernel's parameters where it has them (an attribute may appear once in a function), else parameters of the wrapper's own
     own = {t[3]: t[2] + ('.x' if t[1] == 'uint3' else '') for t in map(_THREAD.match, params) if t}
     lid, tg = own.get('thread_position_in_threadgroup', 'dm_lid'), own.get('threadgroup_position_in_grid', 'dm_tg')
@@ -177,12 +251,12 @@ def to_stage(msl, i, reads=None):
         # The slice: the group's ticket from a counter at the buffer's start (a 32-thread group is one SIMD-group on Apple GPUs: one atomic, broadcast); abi.MESH_SCRATCH_SLICES divides 2^32, so the
         # ticket's wrap stays unique among the groups in flight. It starts zero as the threadgroup array did: uint4 stores, then the words the vectors do not cover
         w4 = words // 4
+        zero = (f'    for (uint i = {lid}; i < {w4}u; i += {thr}u) ((device uint4*)&{mem}[0])[i] = uint4(0u);\n' +
+                (f'    for (uint i = {w4 * 4}u + {lid}; i < {words}u; i += {thr}u) {mem}[i] = 0u;\n' if words % 4 else ''))
         start = (f'    uint dm_t = 0u; if ({lid} == 0u) dm_t = atomic_fetch_add_explicit((device atomic_uint*)dm_scr, 1u, memory_order_relaxed);\n'
                  '    dm_t = simd_broadcast_first(dm_t);\n'
-                 f'    device spvUnsafeArray<uint, {words}>& {mem} = *(device spvUnsafeArray<uint, {words}>*)(dm_scr + {abi.MESH_SCRATCH_HEAD}ul + ulong(dm_t % {abi.MESH_SCRATCH_SLICES}u) * {abi.MESH_SCRATCH_STRIDE}ul);\n'
-                 f'    for (uint i = {lid}; i < {w4}u; i += {thr}u) ((device uint4*)&{mem}[0])[i] = uint4(0u);\n' +
-                 (f'    for (uint i = {w4 * 4}u + {lid}; i < {words}u; i += {thr}u) {mem}[i] = 0u;\n' if words % 4 else '') +
-                 f'    threadgroup_barrier({bar});\n')
+                 f'    device spvUnsafeArray<uint, {words}>& {mem} = *(device spvUnsafeArray<uint, {words}>*)(dm_scr + {abi.MESH_SCRATCH_HEAD}ul + ulong(dm_t % {abi.MESH_SCRATCH_SLICES}u) * {abi.MESH_SCRATCH_STRIDE}ul);\n' +
+                 zero + f'    threadgroup_barrier({bar});\n')
     else:
         start = (f'    threadgroup spvUnsafeArray<uint, {words}> {mem};\n'
                  f'    for (uint i = {lid}; i < {words}u; i += {thr}u) {mem}[i] = 0u;\n'
@@ -239,7 +313,7 @@ def to_stage(msl, i, reads=None):
                 f'    if ({lid} == 0u) {{ {mem}[{wg}] = {tg}; {mem}[{inp}] = {tg}; }}\n') if i['task'] else f'    if ({lid} == 0u) {mem}[{wg}] = dm_block.first + {tg};\n'
         return (f'[[mesh]] void {name}({sig}, dm_mesh_t dm_out' + (', const object_data dm_payload_t& dm_payload [[payload]]' if i['task'] else ', const object_data dm_block_t& dm_block [[payload]]') +
                 scr + f')\n{{\n{start}{fill}'
-                f'    threadgroup_barrier({bar});\n    {call}\n    threadgroup_barrier({bar});\n'
+                f'    threadgroup_barrier({bar});\n' + (raw.block(names, mem, lid, tg, bar, zero, fill, call) if raw else f'    {call}\n') + f'    threadgroup_barrier({bar});\n'
                 f'    uint np = min({mem}[{prim >> 2}] >> 24, {max_p}u);\n'
                 f'    if ({lid} == 0u) dm_out.set_primitive_count(np);\n'
                 f'    for (uint n = {lid}; n < {max_v}u; n += {thr}u)\n    {{\n        uint b = {v_block("n")};\n        dm_vertex_t v;\n{sets}' +

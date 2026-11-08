@@ -342,19 +342,20 @@ def gather_offsets(msl):
 # (nvn_border.h). A filtered sample is linear in the border colour, r = Σ w·texel + w_border·B, so two samples through samplers that differ only in their border colour give the rest:
 # with Metal colours Bn (the sampler) and Bw (its twin), r = s_n + (s_w - s_n)·k, k = (B - Bn) / (Bw - Bn) per channel. Each sampler member a shader samples gets a twin member
 # <member>_w and a bit in the block the shader reads (abi.KIND_BORDER: a mask word, then k per bit); the host sets the bit only for a sampler whose colour Metal lacks and whose wrap
-# mode reaches the border, so every other sample costs a uniform branch and the twin sample runs only there. Tears of the Kingdom's grass bend map (ff9def5b3c418851) samples the
-# previous map with clamp-to-border and border 0.5 (upright): read as transparent black, every row that scrolled in flattened the grass. Samples through sampler arrays, compares
-# and gathers keep the nearest Metal colour
+# mode reaches the border, so every other sample costs a uniform branch and the twin sample runs only there (border_split takes even that out of a body). Tears of the Kingdom's grass
+# bend map (ff9def5b3c418851) samples the previous map with clamp-to-border and border 0.5 (upright): read as transparent black, every row that scrolled in flattened the grass.
+# Samples through sampler arrays, compares and gathers keep the nearest Metal colour
+BORDER_SAMPLE = '''template<typename V, typename T, typename... A> static inline __attribute__((always_inline)) V dm_bs(V r, constant dm_border_t* b, uint i, T t, sampler w, A... a)
+{
+    if (b->mask >> i & 1u) r = dm_bmix(r, t.sample(w, a...), b->k[i]);
+    return r;
+}
+'''
 BORDER_HELPERS = f'''
 struct dm_border_t {{ uint mask; float4 k[{abi.BORDER_SAMPLERS}]; }};
 static inline __attribute__((always_inline)) float4 dm_bmix(float4 r, float4 w, float4 k) {{ return r + (w - r) * k; }}
 static inline __attribute__((always_inline)) float dm_bmix(float r, float w, float4 k) {{ return r + (w - r) * k.x; }}
-template<typename V, typename T, typename... A> static inline __attribute__((always_inline)) V dm_bs(V r, constant dm_border_t* b, uint i, T t, sampler w, A... a)
-{{
-    if (b->mask >> i & 1u) r = dm_bmix(r, t.sample(w, a...), b->k[i]);
-    return r;
-}}
-'''
+{BORDER_SAMPLE}'''
 def border_emu(msl):
     """The samples of the argument buffer's textures through its sampler members, T.sample(S, args) → dm_bs(T.sample(S, args), block, bit, T, S_w, args) (see BORDER_HELPERS);
     the source unchanged when it samples through none. Only samples of float textures: an integer texture is not filtered, and its border colour is Maxwell's integer one, which
@@ -437,6 +438,36 @@ def frag_z_snap(msl):
     body = f'\n    float {ZSNAP_WIDTH} = fwidth(gl_FragCoord.z);' + '\n'.join(lines)   # in uniform control flow, before anything the body does
     msl = msl[:first] + body + msl[end - 1:]
     return msl.replace('using namespace metal;\n', 'using namespace metal;\n\n' + ZSNAP, 1), n
+
+# One branch on the block's mask instead of one per sample: with the bits clear (the draw's samplers have no border colour to correct, nearly every draw) a shader's samples gain nothing
+# from their uniform `if` but a split of the shader into 12-17 blocks, which stops the compiler batching the samples and interleaving the arithmetic between them (Ocarina of Time, M3 Pro,
+# 1536x864: 59 heavy pixel shaders without the mix, GPU p50 18.59 to 17.72 ms). border_split gives the body twice, once with the correction and once without it
+BORDER_SPLIT_SAMPLE = '''template<bool S, typename V, typename T, typename... A> static inline __attribute__((always_inline)) V dm_bs(V r, constant dm_border_t* b, uint i, T t, sampler w, A... a)
+{
+    if (S && (b->mask >> i & 1u)) r = dm_bmix(r, t.sample(w, a...), b->k[i]);
+    return r;
+}
+'''
+def border_split(msl):
+    """The body of a pixel shader's compile source (the file's text, dmsh_side.unit's or dmsh_fetch.fold's: dm_body_main0) or of a compute kernel (main0), with its corrected samples split
+    on the block's mask: the body becomes the template dm_body_main0_bs<DM_BS>, whose dm_bs takes the flag (BORDER_SPLIT_SAMPLE: false, it returns its first sample, so that instantiation is
+    the shader without the correction), and the function the callers know runs the true one only when the mask has a bit set, and the false one otherwise. A pixel shader's dm_body_main0
+    keeps its parameters, so every caller of it (main0, main0_u, main0_f, the alpha test and logic entry points) is as it was; a kernel's main0 keeps its own, and calls the body with them
+    stripped of their attributes. The result is the same for any mask. msl unchanged when it has no such body, a dm_bs call outside it (a helper function would need the flag too) or, in a
+    kernel, a threadgroup variable (its declarations stay in the entry point); a shader without the correction costs what it did"""
+    m = dmsh_side._BODY.search(msl) or re.search(r'^kernel void main0\(', msl, re.M)
+    if not m or BORDER_SAMPLE not in msl: return msl
+    kernel = m.group().startswith('kernel'); start = m.start(); head = dmsh_side._close(msl, m.end(), '(', ')')
+    end = dmsh_side._close(msl, msl.find('{', head) + 1, '{', '}') if head >= 0 else -1
+    if end < 0 or 'dm_bs(' not in msl[head:end] or re.search(r'\bdm_bs\(', msl[:start].replace(BORDER_SAMPLE, '') + msl[end:]) or (kernel and re.search(r'\bthreadgroup\b', msl[head:end])): return msl
+    decl = [re.sub(r'\s*\[\[.*\]\]$', '', p) for p in dmsh_side._params(msl[m.end():head - 1])]; names = [re.search(r'(\w+)$', d) for d in decl]
+    if not all(names) or 'spvDescriptorSet0' not in {n.group(1) for n in names}: return msl
+    decl, args = ', '.join(decl), ', '.join(n.group(1) for n in names)
+    mask = f'spvDescriptorSet0.{abi.BORDER_MEMBER}->mask != 0u'
+    entry = (msl[start:head] + f'\n{{\n    if ({mask}) dm_body_main0_bs<true>({args});\n    else dm_body_main0_bs<false>({args});\n}}\n' if kernel else
+             dmsh_side.BODY + decl + f')\n{{\n    return {mask} ? dm_body_main0_bs<true>({args}) : dm_body_main0_bs<false>({args});\n}}\n')
+    split = f'template<bool DM_BS> static inline __attribute__((always_inline)) {"void" if kernel else "main0_out"} dm_body_main0_bs({decl})' + re.sub(r'\bdm_bs\(', 'dm_bs<DM_BS>(', msl[head:end]) + '\n' + entry
+    return (msl[:start] + split + msl[end:]).replace(BORDER_SAMPLE, BORDER_SPLIT_SAMPLE, 1)
 STORE = shader_cache.Store(os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas.db')))
 atexit.register(STORE.close)   # folds its log into the one file
 CAS_LOCKS, CAS_LOCKS_GUARD = {}, threading.Lock()
@@ -711,7 +742,8 @@ def ps_libraries(key, msl, full, bindings):
     operation ones (dmsh_side.unit), <key>_bf with its readable-tile version main0_f (dmsh_fetch.fold; a shader without a rewritable sample only when bf_want.tsv lists it). The readable-tile
     version was a source and a Metal compile of its own (13,666 of Mario Kart 8 Deluxe's 29,651 shaders). msl: the file of its plain source, full; bindings: its reflection's.
     What does not build is left out, and only that: a unit whose readable-tile version does not build is compiled again without it, one that does not build at all gives <key>_b from the
-    plain source, each with a red line. A library a shader does not get is removed (a stale one of an earlier build), and the host draws without it. → what the reflection says of them.
+    plain source, each with a red line. A library a shader does not get is removed (a stale one of an earlier build), and the host draws without it. A unit is compiled with its body's border
+    colour correction split on the block's mask (border_split), and as it is when that does not build, with a red line. → what the reflection says of them.
     Raises CalledProcessError when the plain source does not compile"""
     targets = [(t, d) for t, d in (('mac', out), ('ios', IOSOUT)) if d and t in TARGETS]
     def drop(*suffixes):
@@ -725,9 +757,16 @@ def ps_libraries(key, msl, full, bindings):
     for unit, fetch in ([(folded, fmeta)] if folded else []) + ([(src, None)] if src else []):
         names = ['_b'] + (['_bx'] if side else []) + (['_bf'] if fetch else [])
         groups = ([side] if side else []) + ([{'main0_f'}] if fetch else [])
-        u = os.path.join(w, key + '_bu.metal'); open(u, 'w').write(unit)
-        try:
+        u = os.path.join(w, key + '_bu.metal')
+        def build(text):
+            open(u, 'w').write(text)
             for t, d in targets: MTL.compile_split(t, u, [os.path.join(d, key + n + '.metallib') for n in names], lambda lib, groups=groups: dmsh_side.cut(lib, *groups))
+        try:
+            split = border_split(unit)   # the samples' border colour correction split on the block's mask (see border_split); the unit as it is when that does not build
+            try: build(split)
+            except (subprocess.CalledProcessError, ValueError) as e:
+                if split == unit: raise
+                print(f'[RED] {key}: the border colour split does not build ({str(e)[:120]}): compiled without it', flush=True); build(unit)
         except (subprocess.CalledProcessError, ValueError) as e:
             if fetch: BF_STATS['failed'] += 1; print(f'[RED] {key}: the readable-tile version does not build ({str(e)[:120]}): its draws go without the tile read', flush=True)
             else: SIDE_STATS['failed'] += 1; print(f'[RED] {key}: the alpha test and logic operation entry points do not build ({str(e)[:120]}): its draws go without them', flush=True)
@@ -1704,6 +1743,8 @@ def finish(key, w, j, c1):
     shared = dmsh_side.shared_body(src) if fu or fd else None   # they call main0's body; fs_uint and fs_dual give none for a main0 whose shape it does not know
     if shared: plain = src; open(msl, 'w').write(shared + (fu or '') + (fd or ''))
     else: fu = fd = None
+    cs = border_split(src) if j['stage'] == 'cs' and not mesh else src   # a kernel's body twice, the border colour correction on the block's mask (see border_split); in the file, as a library is the compile of its .metal (dmsh_mtlcache.py)
+    if cs != src: plain = src; open(msl, 'w').write(cs)
     try: binds = reflect(key, mesh['kind'] if mesh else j['stage'], src, res)   # before the compile: a pixel shader's readable-tile version needs its texture slots (ps_libraries)
     except ValueError as e: return 'reflection failed', str(e)[:160], None
     side, lost = {}, []
@@ -1713,9 +1754,10 @@ def finish(key, w, j, c1):
         if 'ios' in TARGETS and IOSOUT: MTL.compile('ios', msl, os.path.join(IOSOUT, key + '_b.metallib'))
     try: compile_targets()
     except subprocess.CalledProcessError as e:
-        if not lay and not fu and not fd: return 'metal failed', str(e)[:160], None
+        if not lay and not fu and not fd and cs == src: return 'metal failed', str(e)[:160], None
         lost = [name for name, extra in (('layer', lay), ('integer output', fu), ('dual source', fd)) if extra]   # kept in the reflection, as a cache hit compiles nothing: every build reports it (shader_regressions.report_losses)
-        open(msl, 'w').write(plain); lay = fu = fd = None   # the layer, integer-output and dual-source entry points are extras: a library that does not build with them is built without
+        if cs != src: print(f'[RED] {key}: the border colour split does not build ({str(e)[:120]}): compiled without it', flush=True)
+        open(msl, 'w').write(plain); lay = fu = fd = None; cs = src   # the layer, integer-output and dual-source entry points are extras: a library that does not build with them is built without
         try: compile_targets()
         except subprocess.CalledProcessError as e: return 'metal failed', str(e)[:160], None
     clone(msl, os.path.join(out, key + '_b.metal'))
