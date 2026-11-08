@@ -209,6 +209,13 @@
   - The whole game (22,852 shaders, `J=10`, 29 min): the cache holds 1.07 GB for 3.29 GB of entries (3.08×), and none of the 19,550 earlier libraries was asked for. The build's own files peaked at 4.9 GB (cache 1.3, image 3.6), against about 7.6 GB estimated for the plain cache.
 - **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#found-on-this-game) and [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game) builds on a drive with little free room.
 
+### A Mac app packed with the library's image names it `b-<chain>.img.img`
+
+- **Symptom:** the Mac app logs `[RED] shader library …/Contents/Resources/msl/b-<chain> (a folder or a .img file) does not exist` and then `failed to load shader` for its shaders. Its `msl/` holds `b-<chain>.img.img`, and its `Info.plist` has `DMChain` `<chain>.img`.
+- **Cause:** `pack_app.py --msl` takes a library as its folder or as its image (`shader_lib.py`), but named the app's copy after the path it was given. An image path kept its `.img`, and `copy_msl` writes the copy as `<name>.img`. The NSP script passes the folder's path, so only a hand-run `pack_app.py` given `shader/cache/b-<chain>.img` met it.
+- **Fix:** `dm/mac/pack_app.py` names the copy by `shader_lib.name_of`, as `is_chain_library` already reads it, for the first program and for the others (`--program`). `--msl-name` still sets another name.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md), a Mac app packed by hand from the build's `shader/cache/b-<chain>.img`. `test_nsp_mac_app.py` packs a library given as its image.
+
 ### A work folder holds millions of small files
 
 - **Symptom:** a game's `<id>-work` folder is too slow to count: Tears of the Kingdom's held 8,893,028 files and 509 GB, and its count ran past ten minutes.
