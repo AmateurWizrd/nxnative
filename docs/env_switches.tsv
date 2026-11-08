@@ -133,6 +133,7 @@ DM_NVN_CSH_PRESCAN	diagnostic	`0` runs the compute-hoist scan at every pass's fi
 DM_NVN_CS_HOIST	switch	`0` makes a compute dispatch between the draws of a pass end it (on by default: the dispatch runs ahead of the pass when that changes nothing the draws before it read)
 DM_NVN_CUT	switch	`=<draws>`: the replay commits its command buffer every that many draws, between passes (default 64; `0` one command buffer per submission, except the cut after a buffer-to-texture copy)
 DM_NVN_CUT_BUSY	switch	`=0`: a segment boundary commits whatever the GPU is doing (the default commits only when earlier work has reported back, keeping the boundary's GPU timestamp otherwise)
+DM_NVN_CUT_IN_PASS	switch	`=<draws>`: a render pass that has this many draws is cut inside, and the command buffer encoded so far committed, when everything committed before has reported back (the GPU has run out of work); the pass goes on in a new one with load actions (default `0` = off; the cut at `DM_NVN_CUT` comes only between passes; off with `DM_NVN_TBDR=1`, as lazy clears are)
 DM_NVN_DEFER	switch	`0` turns off the deferred pass merging of the TBDR optimizations (which run only with `DM_NVN_TBDR=1`)
 DM_NVN_DEFER_AB	diagnostic	`=1` keeps the deferred pass merging (with `DM_NVN_TBDR=1`) off until the second screenshot has been written, then turns it on, to compare the pictures with and without it
 DM_NVN_DEPTHOVR	diagnostic	`=<fragment shader key prefix>,…`: those draws compare depth with `ALWAYS`; with `DM_NVN_HILITE`, tells "the depth test rejects every fragment" from "nothing rasterizes"
@@ -140,6 +141,7 @@ DM_NVN_DIRECT_UPLOAD	switch	0 disables bounded direct RGBA16F array uploads and 
 DM_NVN_DIRTYCHECK	diagnostic	`=1` fully hashes pool content on every use to find changes the dirty-page tracking missed
 DM_NVN_DISPATCH_OWN	switch	`=1` gives every compute dispatch a compute encoder of its own with full barriers, as before (by default dispatches share the copy encoder); `DM_NVN_PASSGPU` does the same
 DM_NVN_DUAL_WANT	path	`=<file>`: appends the key of each pixel shader a pipeline blends with its output 1 as the second source, while it has no dual-source entry point, to that file, once per key (the profile's `dual_want.tsv`)
+DM_NVN_EMPTY_ENC	switch	`0` opens the helper compute encoders that may find no work (indirect-draw conversion, 8-bit index widening) at their first dispatch instead of before it, so a run with no work costs no encoder and no queue barrier (default `1`: as before); a copy encoder that ends with no operation logs once either way
 DM_NVN_ENC_LABEL	diagnostic	`=1` labels every render encoder `p<pass in frame> <width>x<height> <first 8 digits of the first draw's fragment key> d<draws>` for Instruments traces
 DM_NVN_ENC_THREAD	player	`1` runs the replay's Metal encoding on a thread of its own while the submit thread goes on translating; on by default on iOS (`0` turns it off), off on macOS
 DM_NVN_END_ALIAS	diagnostic	`1` puts the resource-alias flush back on every encoder's end barrier (each costs the command allocator about 100 KB; the start barriers carry it); `ab` alternates it with the `DM_AB` phases
@@ -205,7 +207,7 @@ DM_NVN_TEXINFO	diagnostic	`=<W>x<H>` logs storage and description of every textu
 DM_NVN_TEXRAW	diagnostic	`=<serial>,…` or `info` (the textures `DM_NVN_TEXINFO` picked out): saves those textures' raw bytes at the `DM_NVN_TEXDUMP` frame, with a text header line
 DM_NVN_TEXSNAP	diagnostic	`=<in-frame pass index>,…`: with `DM_NVN_TEXDUMP`, copies those passes' colour attachments as they end and saves them with the end-of-frame dump
 DM_NVN_TREG_ID	diagnostic	`=<n>` logs every registration of texture ID n: what it holds from then on, and the frame being recorded
-DM_NVN_TSV	diagnostic	`=<path>` writes the per-frame NVN call table and timing rows (frame, metric, value) to a TSV, read by `scripts/bench.py`
+DM_NVN_TSV	diagnostic	`=<path>` writes the per-frame NVN call table and timing rows (frame, metric, value) to a TSV, read by `scripts/bench.py`; the GPU rows include per-command-buffer timing: `@gpu_busy_ms` (union of the frame's command buffers' GPU intervals), `@gpu_idle_commit_ms` (GPU idle before a command buffer because the host had not committed it yet), `@gpu_idle_other_ms` (the rest of the span), `@cbs` (command buffers of the frame: submission, segments, upload batches, present snapshots)
 DM_NVN_TSV_CALLS	diagnostic	`0` makes `DM_NVN_TSV` write only the timing rows, without the call counts (about two thirds of the file)
 DM_NVN_TS_HZ	switch	`=<Hz>` sets the tick rate of the raw counter timestamps instead of the profile's `gpu_ts_hz` (default 614,400,000)
 DM_NVN_UB	diagnostic	`="name=item,…;…"`: alternating measurement in one run; odd phases of `DM_NVN_UB_N` frames (default 180) take one category in turn (`@set:<global>=<value>` or dropped shader keys) and log present times

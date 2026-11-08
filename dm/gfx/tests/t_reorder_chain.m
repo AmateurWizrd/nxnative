@@ -248,9 +248,29 @@ static void inherited_target_case(void) {
     uniform_pixels("inherited target: the last draw into it (blue)",out.contents,0,0,255,255);
     mtl_pool_del(setup.p); free(setup.p); mtl_pool_del(c.p); free(c.p);
 }
+// DM_NVN_CUT_IN_PASS (run with --in-pass-cut-only, which sets it to 16): one render pass of 48 draws is cut inside while the GPU has nothing running, and the draws after the cut still land in the same target
+// (draw 0 is blue and writes depth 0; the other 47 are red and depth-test LESS at z=0, so they all fail unless the depth the first half wrote is lost across the cut: the result stays blue)
+static void in_pass_cut_case(void) {
+    tex_t a=texture(8,1,0), ds=texture(8,1,1); chain c=make_chain(); c.width=8;
+    clear(&c,&a,0,&ds,0,0,0);
+    ds_st w={.dt=1,.dw=1,.df=NVN_DEPTH_FUNC_ALWAYS}, t={.dt=1,.dw=0,.df=NVN_DEPTH_FUNC_LESS};
+    for(int i=0;i<48;i++) { if(i<2) state(&c,5,i?&t:&w,sizeof w); draw_prog(&c,i?0:1,0); }
+    emit(&c,OP_END,NULL,0);
+    state_reset(); memset(&R,0,sizeof R); uint64_t cuts=mtl_inpass_cut_count(), passes=g_stat_pass;
+    mtl_sub_begin(); mtl_exec(c.p);
+    EXPECT("in-pass cut: the pass was cut inside",1,mtl_inpass_cut_count()-cuts>=1);
+    EXPECT("in-pass cut: the cut pass went on in a new one",1,g_stat_pass-passes>=2);
+    id<MTLBuffer> out=[g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared]; if(!out) exit(1);
+    [blit() copyFromTexture:tex_mtl(&a) sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(8,8,1)
+      toBuffer:out destinationOffset:0 destinationBytesPerRow:32 destinationBytesPerImage:256];
+    EXPECT("in-pass cut: the submission completed",1,mtl_wait(mtl_sub_commit(),5000000000ull));
+    EXPECT("in-pass cut: no error in commit feedback",0,mtl_last_commit_error());
+    uniform_pixels("in-pass cut: depth written before the cut still rejects the red draws after it (blue)",out.contents,0,0,255,255);
+    mtl_pool_del(c.p); free(c.p);
+}
 int main(int argc,char **argv) { @autoreleasepool {
     setvbuf(stdout,NULL,_IONBF,0);
-    all_independent=argc>1&&!strcmp(argv[1],"--all-independent"); setenv("DM_NVN_TBDR","0",1); mtl_init();
+    all_independent=argc>1&&!strcmp(argv[1],"--all-independent"); setenv("DM_NVN_TBDR","0",1); int in_pass=argc>1&&!strcmp(argv[1],"--in-pass-cut-only"); if(in_pass) setenv("DM_NVN_CUT_IN_PASS","16",1); mtl_init();
     NSError *err=nil; id<MTLLibrary> lib=[g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
       "vertex float4 v(uint n [[vertex_id]]){float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)};return float4(p[n],0,1);}\n"
       "fragment float4 red(){return float4(1,0,0,1);} fragment float4 blue(){return float4(0,0,1,1);} fragment float4 green(){return float4(0,1,0,1);}\n"
@@ -265,6 +285,7 @@ int main(int argc,char **argv) { @autoreleasepool {
         p->sh[1]=[NvShader new]; NvShader *f=p->sh[1]; f->fn=[lib newFunctionWithName:fn[i]]; f->stage=1;
         if(i>=2&&i!=7) { f->rf.nb=1; f->rf.b[0]=(nvn_rbind){.kind=i==4?NVN_RB_CBUF:NVN_RB_TEX,.dtt=i==6?3:2}; f->ae=[f->fn newArgumentEncoderWithBufferIndex:0]; }
         pg[i].serial=4000+i; serial_put(pg[i].serial,p); }
+    if(in_pass) { printf("CASE in_pass_cut\n"); in_pass_cut_case(); printf("== %d checks, %d failed ==\n",count,fail); return fail!=0; }
     printf("CASE inherited_target\n"); inherited_target_case();
     if(argc>1&&!strcmp(argv[1],"--inherited-target-only")) { printf("== %d checks, %d failed ==\n",count,fail); return fail!=0; }
     const char *names[]={"independent_mip_copy","same_mip_negative","stencil_disjoint_bits","stencil_shared_bits_negative","copy_reads_source_negative","in_block_order_negative"};

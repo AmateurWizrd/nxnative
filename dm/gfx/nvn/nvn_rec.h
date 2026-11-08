@@ -116,6 +116,7 @@ static void rec_exec(const rec_t *r) {
     case RO_COMMIT: case RO_COMMIT_REAL: {
         if (r->op == RO_COMMIT) ubc_wait(a[2]);   // the uniform shadows this command buffer reads
         id<MTL4CommandBuffer> buffers[] = {r->op == RO_COMMIT ? g_rx_cb : rec_id(a[1])}; MTL4CommitOptions *o = rec_id(a[0]);
+        cbt_stamp(o);   // DM_NVN_TSV: the time the command buffer really reaches the queue (per-command-buffer GPU timing, nvn_mtl.m)
         pthread_mutex_lock(&g_res_mu);
         if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
         pthread_mutex_unlock(&g_res_mu);
@@ -344,13 +345,13 @@ static id rec_table(id t) { if (!rec_on() || !t) return t; DmRecTable *s = [DmRe
 static void rec_commit(id cb, MTL4CommitOptions *o) {
     if ([cb isKindOfClass:[DmRecCB class]]) { rec_t *r = rec_put(RO_COMMIT, 1); r->a[0] = rec_obj(o); r->a[2] = ubc_head(); return; }
     ubc_wait(ubc_head());
-    id<MTL4CommandBuffer> buffers[] = {cb};
+    id<MTL4CommandBuffer> buffers[] = {cb}; cbt_stamp(o);
     if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
 }
 // An upload batch: its place in the queue is after what is recorded so far (it reads no uniform shadow)
 static void rec_commit_upload(id cb, MTL4CommitOptions *o) {
     if (rec_on() && g_rb_started) { rec_t *r = rec_put(RO_COMMIT_REAL, 2); r->a[0] = rec_obj(o); r->a[1] = rec_obj(cb); return; }
-    id<MTL4CommandBuffer> buffers[] = {cb};
+    id<MTL4CommandBuffer> buffers[] = {cb}; cbt_stamp(o);
     if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
 }
 // A queue operation (a sparse texture's mapping update, nvn_mtl.m sparse_*): on the encoding thread in its place among the recorded commits, so it reaches the queue before the upload batch

@@ -136,6 +136,8 @@ static int g_res_dirty;
 static id<MTLSharedEvent> g_ev;
 static _Atomic uint64_t g_fence;                // Highest committed fence value (incremented exclusively by the submit thread)
 static int g_cut_copy;                          // a buffer → texture copy was encoded since the last commit: the next pass boundary commits the segment (sub_cut)
+static int g_cut_now;                           // DM_NVN_CUT_IN_PASS: sub_cut was asked for by a draw in the middle of a pass (ended just before): the draw-count test does not apply
+static uint64_t g_pass_draw0, g_inpass_cuts;    // g_stat_draw when the open render pass began; segments cut inside a pass
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_done;                 // GPU complete and all CPU-visible effects through this fence published
@@ -269,6 +271,7 @@ static void ws_report(uint64_t frame, uint64_t frames) {
         if (n && o < sizeof line - 160) o += snprintf(line + o, sizeof line - o, " %s %.2f/frame (blocked %.2f, %.3f ms);", ws_name[i], (double)n / frames, (double)b / frames, ns / 1e6 / frames); }
     MLOG("[waits] up to frame %llu, per frame:%s", (unsigned long long)frame, o ? line : " none");
 }
+static void cbt_stamp(MTL4CommitOptions *o);   // DM_NVN_TSV per-command-buffer GPU timing (below, before gpu_tag_begin); nvn_rec.h calls it where a commit really happens
 #include "nvn_rec.h"   // deferred encoding (DM_NVN_ENC_THREAD)
 static NSHashTable *g_res_objects;
 static _Atomic unsigned g_image_heap_n, g_big_n;   // g_big_n: large pools in chunks, whose buffers overlap (BIG_MIN)
@@ -1277,6 +1280,7 @@ static id<MTL4ComputeCommandEncoder> g_blit;
 // Buffer operations may use distinct Metal GPU addresses for one allocation
 // (overlapping pools or sparse mappings). Their encoder barriers need alias cache visibility.
 static int g_blit_alias;
+static int g_blit_nops; static uint64_t g_blit_empty;   // operations (copies, updates, fills, dispatches) encoded into the open copy encoder; copy encoders that ended with none
 static inline MTL4VisibilityOptions blit_vis(void) { return resource_vis() | (g_blit_alias ? MTL4VisibilityOptionResourceAlias : 0); }
 static NSMutableArray<dispatch_block_t> *g_commit_blocks;
 // The uniform shadows taken once a shader with stores through loaded pointers has run (g_gml_on), each with the fence of the submission that took it: every shadow made or checked
@@ -1399,11 +1403,12 @@ static void gp_end(id e);
 // enc_c_begin, blit_open, and the scaler's own before MetalFX), which waits for all earlier work and then flushes the aliases, so the flush for an encoder's writes still comes before
 // any later encoder reads them. A copy encoder that wrote through an aliased buffer address (g_blit_alias) keeps the alias flush on its end barrier as well
 // DM_NVN_END_ALIAS=1 puts the alias flush back on every end barrier (ab: alternated with the DM_AB phases, for measuring)
-static int sw_mode(const char *name, int dflt); static inline int sw_on(int m);
+static int sw_mode(const char *name, int dflt); static inline int sw_on(int m); static void blit_empty_note(void);
 static inline void m4_end(id e) {
     gp_end(e);
     static int end_alias = -1; if (end_alias < 0) end_alias = sw_mode("DM_NVN_END_ALIAS", 0);
     MTL4VisibilityOptions vis = e == g_blit && g_blit_alias ? blit_vis() : end_alias && sw_on(end_alias) ? resource_vis() : MTL4VisibilityOptionDevice; if (e == g_blit) g_blit_alias = 0;
+    if (e == g_blit && !g_blit_nops) blit_empty_note();
     if ([e conformsToProtocol:@protocol(MTL4CommandEncoder)]) [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:vis];
     [e endEncoding]; g_last_end_relaxed = 0; cm_enc_mark(-1);
 }
@@ -1577,8 +1582,12 @@ static uint64_t g_bw_lo[BW_MAX], g_bw_hi[BW_MAX], g_br_lo[BW_MAX], g_br_hi[BW_MA
 static uint64_t g_blit_splits;   // copies / buffer updates / fills that ended an open draw pass (the residency set line; a pass ended this way stores and the next one reloads its attachments)
 uint64_t mtl_blit_splits(void) { return g_blit_splits; }
 static int enc_open(void);
+static void blit_empty_note(void) { if (!g_blit_empty++) MLOG("a copy encoder ended with no copy, update, fill or dispatch (first case: frame %llu pass %llu): its two barriers did nothing (DM_NVN_EMPTY_ENC)", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass); }
 static int g_blit_ct;   // the open copy encoder has the compute argument table set (dispatches share it, dispatch_enc)
-static id<MTL4ComputeCommandEncoder> blit_open(void) { if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; gp_begin(g_blit, 'C', nil); g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_ct = 0; } return g_blit; }
+// DM_NVN_EMPTY_ENC=0|1 (default 1 = as before): 0 opens the compute encoders of the helper passes that may find no work (ixc_run, wide_run) at their first dispatch, not before the loop that decides it, so one with
+// nothing to run costs no encoder and no queue barrier. The copy encoder (blit_open) is only opened by a call that encodes into it at once, so there is nothing to defer there (the ones gpuprof lists as empty are texture copies, see blit)
+static int empty_enc(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_EMPTY_ENC"); v = !e || atoi(e) != 0; if (!v) MLOG("DM_NVN_EMPTY_ENC=0: helper compute encoders open at their first dispatch"); } return v; }
+static id<MTL4ComputeCommandEncoder> blit_open(void) { if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; gp_begin(g_blit, 'C', nil); g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_ct = 0; g_blit_nops = 0; } return g_blit; }
 static void ubd_flush(void); static int g_nubd;   // the inline updates deferred (see mtl_sub_update)
 static int g_ubd_landing;
 static id<MTL4ComputeCommandEncoder> blit_raw(void) {
@@ -1632,7 +1641,7 @@ static id<MTL4ComputeCommandEncoder> blit_buf(uint64_t rlo, uint64_t rhi, uint64
     // range-based batching, including separate Metal buffers over one CPU range.
     if (nvn_sparse_alias(rlo, rhi) || nvn_sparse_alias(wlo, whi)) { wlo = 0; whi = ~0ull; }
     if (g_blit_ops && (g_bw_n == BW_MAX || g_br_n == BW_MAX || (rhi > rlo && bw_hit(rlo, rhi)) || bw_hit(wlo, whi) || br_hit(wlo, whi))) blit_barrier();
-    g_bw_lo[g_bw_n] = wlo; g_bw_hi[g_bw_n++] = whi; g_blit_ops++; g_gp_copies++;
+    g_bw_lo[g_bw_n] = wlo; g_bw_hi[g_bw_n++] = whi; g_blit_ops++; g_blit_nops++; g_gp_copies++;
     if (rhi > rlo) { g_br_lo[g_br_n] = rlo; g_br_hi[g_br_n++] = rhi; }
     return e;
 }
@@ -1640,7 +1649,7 @@ static id<MTL4ComputeCommandEncoder> blit_buf(uint64_t rlo, uint64_t rhi, uint64
 static id<MTL4ComputeCommandEncoder> blit(void) {
     id<MTL4ComputeCommandEncoder> e = blit_raw();
     if (g_blit_ops) blit_barrier();
-    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // record as "everything written": the next operation always gets a barrier
+    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1; g_blit_nops++; g_gp_copies++;   // record as "everything written": the next operation always gets a barrier. Counted as a copy for gpuprof: its encoders listed as empty were texture copies
     return e;
 }
 
@@ -2140,6 +2149,49 @@ static void gpu_capture_frame(uint64_t f) {
     } else if (g_cap_on && f >= (uint64_t)g_cap_f0 + (uint64_t)g_cap_n) { [m stopCapture]; g_cap_on = 0; g_cap_f0 = -1; gpu_thr = 0; MLOG("DM_GPU_CAPTURE: capture stopped at frame %llu (the trace is written in the background)", (unsigned long long)f); }
 }
 void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); if (ab_len()) ab_frame(f); gpu_capture_frame(f); }
+// DM_NVN_TSV per-command-buffer GPU timing (rows @gpu_busy_ms / @gpu_idle_commit_ms / @gpu_idle_other_ms / @cbs, written by hle_nvn.c beside @gpu_beg_ms): every command buffer of a frame (the main submission and its segments,
+// upload batches, present snapshots) is registered before its commit (cbt_new), carries the time its commit really happens (cbt_stamp, called from nvn_rec.h: the encode thread's RO_COMMIT / RO_COMMIT_REAL, else the direct commit)
+// and reports its GPU start / end in its feedback (cbt_done). Without DM_NVN_TSV cbt_new returns nil and all of it is a no-op. The frame tagging is gpu_tag_begin's (the frame current at the commit)
+@interface DmCbT : NSObject { @public double commit; uint64_t frame; } @end
+@implementation DmCbT @end
+static int cbt_on(void) { static int v = -1; if (v < 0) v = getenv("DM_NVN_TSV") != NULL; return v; }
+enum { CBT_RING = 32, CBT_MAX = 128 };
+static struct { uint64_t frame; int n, total, pending; struct { double c, pe, g0, g1; } cb[CBT_MAX]; } g_cbt[CBT_RING];   // c: commit time (0 = not stamped); pe: the latest GPU end reported before this one's
+static double g_cbt_pe; static os_unfair_lock g_cbt_lk = OS_UNFAIR_LOCK_INIT; static const char g_cbt_key;   // g_cbt_pe: feedbacks come in queue order, so it is the GPU end of the command buffer that ran before
+static DmCbT *cbt_new(uint64_t f, MTL4CommitOptions *o) {
+    if (!cbt_on()) return nil;
+    DmCbT *t = [DmCbT new]; t->frame = f;
+    os_unfair_lock_lock(&g_cbt_lk); typeof(g_cbt[0]) *s = &g_cbt[f % CBT_RING]; if (s->frame != f) { s->frame = f; s->n = s->total = s->pending = 0; } s->pending++; os_unfair_lock_unlock(&g_cbt_lk);
+    objc_setAssociatedObject(o, &g_cbt_key, t, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return t;
+}
+static void cbt_stamp(MTL4CommitOptions *o) { if (o && cbt_on()) { DmCbT *t = objc_getAssociatedObject(o, &g_cbt_key); if (t) t->commit = CACurrentMediaTime(); } }
+static void cbt_done(DmCbT *t, double g0, double g1) {
+    if (!t) return;
+    os_unfair_lock_lock(&g_cbt_lk); typeof(g_cbt[0]) *s = &g_cbt[t->frame % CBT_RING];
+    if (s->frame == t->frame) { s->total++; if (g0 > 0 && g1 > g0 && s->n < CBT_MAX) s->cb[s->n++] = (typeof(s->cb[0])){t->commit, g_cbt_pe, g0, g1}; s->pending--; }
+    if (g1 > g_cbt_pe) g_cbt_pe = g1;
+    os_unfair_lock_unlock(&g_cbt_lk);
+}
+static void cbt_gpu_end(double g1) { if (cbt_on()) { os_unfair_lock_lock(&g_cbt_lk); if (g1 > g_cbt_pe) g_cbt_pe = g1; os_unfair_lock_unlock(&g_cbt_lk); } }   // a command buffer of no frame (the display one) still keeps the GPU busy
+// The frame's command buffers swept in GPU start order: busy = union of their intervals; idle_commit = the gap before a command buffer that lies between the previous one's GPU end and its commit (the GPU waited for the host
+// to commit it); idle_other = the rest of the span (first start to last end) that is neither. Ms. Returns 0 until every command buffer of the frame has reported (or when there is none)
+int mtl_cbt_frame(uint64_t f, double *busy, double *idle_commit, double *idle_other, int *n) {
+    typeof(g_cbt[0].cb[0]) v[CBT_MAX]; int m = 0, total = 0, ok;
+    os_unfair_lock_lock(&g_cbt_lk); typeof(g_cbt[0]) *s = &g_cbt[f % CBT_RING];
+    ok = s->frame == f && !s->pending && s->n > 0; if (ok) { m = s->n; total = s->total; memcpy(v, s->cb, m * sizeof v[0]); }
+    os_unfair_lock_unlock(&g_cbt_lk);
+    if (!ok) return 0;
+    for (int i = 1; i < m; i++) { typeof(v[0]) x = v[i]; int j = i; for (; j > 0 && v[j - 1].g0 > x.g0; j--) v[j] = v[j - 1]; v[j] = x; }
+    double beg = v[0].g0, end = beg, b = 0, ic = 0;
+    for (int i = 0; i < m; i++) {
+        double gap = v[i].g0 - end;
+        if (gap > 0 && v[i].c > 0) ic += fmin(gap, fmax(0, fmin(v[i].c, v[i].g0) - fmax(v[i].pe, end)));
+        b += fmax(0, v[i].g1 - fmax(v[i].g0, end)); end = fmax(end, v[i].g1);
+    }
+    *busy = b * 1e3; *idle_commit = ic * 1e3; *idle_other = fmax(0, end - beg - b - ic) * 1e3; *n = total;
+    return 1;
+}
 // GPU timing registration: gpu_tag_begin(frame) before commit, gpu_tag_done(frame, GPU start, GPU end) on completion (seconds on the CACurrentMediaTime base).
 // Old-queue command buffers go through gpu_tag_f; the Metal 4 main submission backfills in the feedback of mtl_sub_commit (when switching to Metal 4 all the call sites were lost and the GPU column of the timing line became empty)
 static void gpu_tag_begin(uint64_t f) {
@@ -2264,7 +2316,7 @@ uint64_t mtl_sub_commit(void) {
     MTL4CommitOptions *o = [MTL4CommitOptions new];
     atomic_fetch_add(&g_seg_inflight, 1);
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; atomic_fetch_sub(&g_seg_inflight, 1); for (dispatch_block_t block in commit_blocks) block(); }];
-    uint64_t gpu_f = atomic_load(&g_cur_frame); gpu_tag_begin(gpu_f);
+    uint64_t gpu_f = atomic_load(&g_cur_frame); gpu_tag_begin(gpu_f); DmCbT *cbt = cbt_new(gpu_f, o);
     NSString *cctx = @(cctx_snap());
     cbs_list *cbs = cbs_take();
     seg_clk *sc = g_sclk; uint32_t seg_last = g_seg; g_sclk = NULL;
@@ -2274,7 +2326,7 @@ uint64_t mtl_sub_commit(void) {
     pthread_mutex_unlock(&g_post_mu);
     int lost_test = gpu_lost_test();
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
-        gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
+        gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime); cbt_done(cbt, cb.GPUStartTime, cb.GPUEndTime);
         if (ws_on()) ws_fb(fence, cb.GPUEndTime);
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
         if (cb.error) { atomic_store(&g_last_commit_error, 1); res_top_once(cb.error); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
@@ -2969,7 +3021,7 @@ static void up_flush(void) {
     NSMutableSet *targets = [NSMutableSet setWithArray:g_up_texs]; for (int i = 0; i < g_nup_blits; i++) if (g_up_blits[i].dst) [targets addObject:g_up_blits[i].dst];
     NSArray *dsts = targets.allObjects;
     static int lost_at = -2; static uint64_t batch_n; if (lost_at == -2) { const char *e = getenv("DM_TEST_UP_LOST"); lost_at = e ? atoi(e) : -1; } int fake_lost = dsts.count && lost_at > 0 && (int)++batch_n == lost_at;
-    MTL4CommitOptions *o = [MTL4CommitOptions new];
+    MTL4CommitOptions *o = [MTL4CommitOptions new]; DmCbT *cbt = cbt_new(atomic_load(&g_cur_frame), o);
     atomic_fetch_add(&g_up_pending, 1);
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         if (f.error) { MLOG("[RED] upload command buffer execution error: %s", f.error.description.UTF8String); res_top_once(f.error); gpu_lost_check(f.error, "upload"); }
@@ -2981,6 +3033,7 @@ static void up_flush(void) {
             if (f.error) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1100 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ pthread_mutex_lock(&g_smu); g_ser_gen++; pthread_mutex_unlock(&g_smu); });
             MLOG("%supload command buffer dropped: the %lu textures of this batch are marked unwritten and re-uploaded on next use (%d awaiting re-upload)", fake_lost ? "DM_TEST_UP_LOST: " : "", (unsigned long)dsts.count, n);
         }
+        cbt_done(cbt, f.GPUStartTime, f.GPUEndTime);
         double d = f.GPUEndTime - f.GPUStartTime;
         if (d > 0) atomic_fetch_add(&g_upload_gpu_ns, (uint64_t)(d * 1e9));
         @autoreleasepool {
@@ -5101,7 +5154,7 @@ static void bare_dims(NSUInteger *w, NSUInteger *h);
 static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     if (g_enc) return g_enc;
     memset(g_zskip_cand_ok, 0, sizeof g_zskip_cand_ok);
-    g_enc_mode = clear_only; g_enc_geo_nocolor = g_geo_omit_colors; g_pass_swrite = g_pass_order = g_pass_late_res = 0; g_sm_pass = 0;
+    g_enc_mode = clear_only; g_enc_geo_nocolor = g_geo_omit_colors; g_pass_swrite = g_pass_order = g_pass_late_res = 0; g_sm_pass = 0; g_pass_draw0 = g_stat_draw;
     if (!R.has_rt) { RED_ONCE(3, "no render target set before the draw"); return nil; }
     if (g_imfit_npend) img_fit_upgrade();   // no pass is open here: the upgrade's copy may run (img_fit)
     // The version of the attachment-range candidate is taken before capturing any attachment; if it changes during setup, there is no continuation.
@@ -12109,7 +12162,7 @@ static void ixc_run(const p_draw *dw, const p_draw_idx *di) {
     typedef struct { uint64_t rec, ib, out, args; uint32_t prim, isz, ilen, cap; } ejob;
     id<MTLBuffer> ab; size_t ao = arena_alloc((size_t)n * (32 + sizeof(ajob)), &ab); uint64_t ag = ab.gpuAddress + ao;   // n argument records (32 bytes apart), then the arrays jobs
     ajob *aj = (ajob *)((uint8_t *)ab.contents + ao + (size_t)n * 32);
-    id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL); [ce setArgumentTable:at];
+    id<MTL4ComputeCommandEncoder> ce = nil; if (empty_enc()) { ce = enc_c_begin(NULL); [ce setArgumentTable:at]; }   // DM_NVN_EMPTY_ENC=0: opened at the first dispatch, so a run that finds no address costs no encoder
     for (int i = 0; i < n; i++) {
         ixc_ent *e = &g_ixc[n0 + i]; uint64_t rec, ib = 0; void *mb; uint64_t mo; e->args = 0;
         if (!mtl_gpu_addr(e->ind, e->itype < 0 ? 16 : 20, &mb, &mo, &rec)) continue;
@@ -12122,14 +12175,15 @@ static void ixc_run(const p_draw *dw, const p_draw_idx *di) {
             id<MTLBuffer> ob; size_t oo = arena_alloc(IXC_CAP * 4 + sizeof(ejob), &ob);
             ejob *j = (ejob *)((uint8_t *)ob.contents + oo + IXC_CAP * 4);
             *j = (ejob){rec, ib, ob.gpuAddress + oo, ag + 32 * (uint64_t)i, (uint32_t)e->prim, e->itype == 0 ? 1u : e->itype == 1 ? 2u : 4u, (uint32_t)MIN(((__bridge id<MTLBuffer>)mb).length - mo, 0xffffffffull), IXC_CAP};
+            if (!ce) { ce = enc_c_begin(NULL); [ce setArgumentTable:at]; }
             [at setAddress:ob.gpuAddress + oo + IXC_CAP * 4 atIndex:0]; [ce setComputePipelineState:ps[1]];
             [ce dispatchThreadgroups:MTLSizeMake(IXC_CAP / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             e->ixb = ob.gpuAddress + oo; e->ixlen = IXC_CAP * 4; e->args = ag + 32 * (uint64_t)i;
             { static int once; if (!once++) MLOG("indirect indexed draw (primitive %d, %d-byte indices) expanded to 32-bit indices on the GPU, at most %d", e->prim, e->itype == 0 ? 1 : e->itype == 1 ? 2 : 4, IXC_CAP); }
         }
     }
-    if (na) { [at setAddress:ag + (uint64_t)n * 32 atIndex:0]; [ce setComputePipelineState:ps[0]]; [ce dispatchThreadgroups:MTLSizeMake((NSUInteger)na, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; }
-    enc_c_end(ce);
+    if (na) { if (!ce) { ce = enc_c_begin(NULL); [ce setArgumentTable:at]; } [at setAddress:ag + (uint64_t)n * 32 atIndex:0]; [ce setComputePipelineState:ps[0]]; [ce dispatchThreadgroups:MTLSizeMake((NSUInteger)na, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; }
+    if (ce) enc_c_end(ce);
     args_dirty_all();
     if (!g_ixc_runs++) MLOG("indirect draw conversion: first time, %d draws (records for quads / fans / 8-bit indices become indexed indirect arguments in a compute pass before the render pass)", n);
     else if (g_ixc_runs % 3600 == 0) MLOG("indirect draw conversion: %llu times, render pass split %llu times", (unsigned long long)g_ixc_runs, (unsigned long long)g_ixc_splits);
@@ -12181,17 +12235,18 @@ static void wide_run(const p_draw_idx *di) {
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     typedef struct { uint64_t src, dst; uint32_t n, shift; } wjob;
     id<MTLBuffer> jb; size_t jo = arena_alloc((size_t)n * sizeof(wjob), &jb); wjob *jp = (wjob *)((uint8_t *)jb.contents + jo);
-    id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL); [ce setArgumentTable:at]; [ce setComputePipelineState:ps];
+    id<MTL4ComputeCommandEncoder> ce = nil; if (empty_enc()) { ce = enc_c_begin(NULL); [ce setArgumentTable:at]; [ce setComputePipelineState:ps]; }   // DM_NVN_EMPTY_ENC=0: opened at the first dispatch
     for (int i = 0; i < n; i++) {
         wide_ent *e = &g_wide[n0 + i]; void *mb; uint64_t mo, src; e->gpu = 0;
         if (!mtl_gpu_addr(e->ibuf, (uint64_t)e->count, &mb, &mo, &src)) continue;   // the draw reports it (RED_ONCE 22)
         id<MTLBuffer> ob; size_t oo = arena_alloc((size_t)e->count * 2, &ob);
         jp[i] = (wjob){src & ~15ull, ob.gpuAddress + oo, (uint32_t)e->count, (uint32_t)(src & 15)};
+        if (!ce) { ce = enc_c_begin(NULL); [ce setArgumentTable:at]; [ce setComputePipelineState:ps]; }
         [at setAddress:jb.gpuAddress + jo + (uint64_t)i * sizeof(wjob) atIndex:0];
         [ce dispatchThreadgroups:MTLSizeMake(((NSUInteger)e->count + 63) / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         e->gpu = ob.gpuAddress + oo;
     }
-    enc_c_end(ce);
+    if (ce) enc_c_end(ce);
     args_dirty_all();
     g_wide_draws += (uint64_t)n;
     if (!g_wide_runs++) MLOG("8-bit index GPU expansion: first time, %d draws (the indices have GPU-side writes in this submission; a compute pass expands them to 16 bits before the render pass)", n);
@@ -12646,6 +12701,10 @@ static int skip_fs_draw(NvProg *pr) {
     for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) return 1;
     return 0;
 }
+static void sub_cut(void);
+// DM_NVN_CUT_IN_PASS=<draws> (default 0 = off): a render pass of at least this many draws is cut inside, when the GPU has run out of work (nothing committed is still running). The segment cut (DM_NVN_CUT) only comes between
+// passes, so a pass of 600+ draws kept everything encoded before it from the GPU until its last draw was encoded (Ocarina of Time's 3D pass). The cut ends the pass and the next draw reopens it with load actions. Off with DM_NVN_TBDR=1 (as lazy clears are): sdx_decide skips attachment events whose SetRenderTargets precedes the cut op, so the first half's store could become DontCare and the reopened pass would load undefined content
+static int cut_in_pass(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_CUT_IN_PASS"); v = e ? atoi(e) : 0; if (v < 0) v = 0; if (v) MLOG("DM_NVN_CUT_IN_PASS=%d: a render pass of that many draws is cut inside when the GPU has run out of work", v); } return v; }
 static void draw(const p_draw *dw, const p_draw_idx *di) { cp_stamp start = cp_begin(); if (dw && dw->prim == DM_PRIM_MESH_TASKS) mesh_tasks_draw(dw); else draw_(dw, di); cp_end(5, start); }
 static void draw_(const p_draw *dw, const p_draw_idx *di) {
     g_draw_binst = (uint32_t)(dw ? dw->base_instance : di ? di->base_instance : 0);   // c0 + 0x644 of the stages that read the driver segment (encode_args)
@@ -12683,6 +12742,11 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     if (!mdx_on && ((di && di->mdi_cnt && !mdi_live(di->mdi_cnt, di->mdi_i)) || (dw && dw->mdi_cnt && !mdi_live(dw->mdi_cnt, dw->mdi_i)))) return;   // past the multi-draw's count
     if (mdx_on && mdx_next(dw, di)) return;   // the next draw of a masked multi-draw: only the draw is encoded
     g_mdxc.next = NULL;
+    // The conditions are those of sub_cut (no pass deferred / merged / hoisted / fused) plus the draw kinds that keep encoder state across draws. The inline updates deferred (g_nubd) are not landed: as at a pass end they wait for the next copy or dispatch or a draw that reads them (ubd_conflict)
+    if (g_enc && cut_in_pass() && !tbdr_on() && g_cb && g_stat_draw - g_pass_draw0 >= (uint64_t)cut_in_pass() && !g_rt_merged && !g_sm_pass && !g_fz.active && !g_fz_checking && !g_defer_replaying && !g_geo_program && !g_geo_mesh.on && !g_mtk.on
+        && !g_hoist_n && !g_defer_nact && !g_defer_pend && atomic_load_explicit(&g_seg_inflight, memory_order_relaxed) == 0) {
+        PD("M %llu render pass cut here after %llu draws: the GPU has run out of work", g_stat_pass, (unsigned long long)(g_stat_draw - g_pass_draw0));
+        rp_end(); g_cut_now = 1; sub_cut(); g_cut_now = 0; g_pass_draw0 = g_stat_draw; }
     if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
     image_prepare(pr, 0x1f);
@@ -13080,7 +13144,7 @@ static int dispatch_own(void) {
 static id<MTL4ComputeCommandEncoder> dispatch_enc(void) {
     id<MTL4ComputeCommandEncoder> e = blit_open(); g_gp_disp++;
     if (g_blit_ops) blit_barrier();
-    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // recorded as "everything written": the next copy or dispatch gets a barrier
+    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1; g_blit_nops++;   // recorded as "everything written": the next copy or dispatch gets a barrier
     if (!g_blit_ct) { [e setArgumentTable:g_ct]; g_blit_ct = 1; }
     args_dirty_all();
     return e;
@@ -13898,7 +13962,7 @@ int mtl_probe_ramp_on(void) { return sw_on(probe_ramp_mode()); }
 static void sub_cut(void) {
     int n = cut_draws();
     if (!g_cb || g_enc) return;
-    if ((!g_cut_copy && (n <= 0 || g_stat_draw - g_cut_draw0 < (uint64_t)n)) || g_hoist_n || g_defer_nact || g_defer_pend || g_fz.active || g_rt_merged) return;
+    if ((!g_cut_copy && !g_cut_now && (n <= 0 || g_stat_draw - g_cut_draw0 < (uint64_t)n)) || g_hoist_n || g_defer_nact || g_defer_pend || g_fz.active || g_rt_merged) return;
     // The cut is there so that the GPU does not sit idle while the host encodes. With earlier work still running a commit gains nothing and queues one more command buffer: each is a call into the kernel on Metal's one submission queue, and with buffers queued behind running work
     // the GPU waited 5-40 ms with the next one already committed (docs/reference/frame-rate.md). So it stays a boundary for the game's timestamps (ts_boundary), with the commit left for when the GPU has run out. A copy still commits, as its data must land. DM_NVN_CUT_BUSY=0: every cut commits
     static int busy = -1; if (busy < 0) { const char *e = getenv("DM_NVN_CUT_BUSY"); busy = !e || atoi(e) != 0; }
@@ -13914,11 +13978,11 @@ static void sub_cut(void) {
     uint32_t k = g_seg++; seg_clk *sc = NULL;   // reports encoded so far keep this segment's GPU times (seg_ts)
     if (seg_ts()) { if (!g_sclk) { g_sclk = calloc(1, sizeof *g_sclk); atomic_store(&g_sclk->refs, 1); } sc = g_sclk; atomic_fetch_add(&sc->refs, 1); }
     cbs_list *cbs = cbs_take(); uint64_t cbs_fence = g_fence + 1;
-    MTL4CommitOptions *o = [MTL4CommitOptions new];
+    MTL4CommitOptions *o = [MTL4CommitOptions new]; DmCbT *cbt = cbt_new(f, o);
     atomic_fetch_add(&g_seg_inflight, 1);
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
         atomic_fetch_sub(&g_seg_inflight, 1);
-        gpu_tag_done(f, cb.GPUStartTime, cb.GPUEndTime);
+        gpu_tag_done(f, cb.GPUStartTime, cb.GPUEndTime); cbt_done(cbt, cb.GPUStartTime, cb.GPUEndTime);
         if (sc) { if (k < SEG_CLK_N) { atomic_store(&sc->t[k][0], gpu_s_guest_ns(cb.GPUStartTime)); atomic_store(&sc->t[k][1], gpu_s_guest_ns(cb.GPUEndTime)); } seg_clk_put(sc); }
         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int k; if (k++ < 8) MLOG("[RED] segment command buffer execution error: %s", cb.error.description.UTF8String); res_top_once(cb.error); }
         char where[64]; snprintf(where, sizeof where, "fence %llu, segment %u", (unsigned long long)cbs_fence, k); cbs_feedback(cbs, cb.error, where);
@@ -13933,8 +13997,10 @@ static void sub_cut(void) {
     [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]];   // one allocator encodes several command buffers in sequence; it is reset only once its fence (the last segment) has passed, when a later submission starts
     g_cut_draw0 = g_stat_draw;
     if (!g_cuts++) MLOG("segmented submission: first segment submitted at frame %llu pass %llu", (unsigned long long)f, (unsigned long long)g_stat_pass);
+    if (g_cut_now && !g_inpass_cuts++) MLOG("segmented submission: first segment cut inside a render pass at frame %llu pass %llu (DM_NVN_CUT_IN_PASS)", (unsigned long long)f, (unsigned long long)g_stat_pass);
 }
 uint64_t mtl_cut_count(void) { return g_cuts; }
+uint64_t mtl_inpass_cut_count(void) { return g_inpass_cuts; }
 uint64_t mtl_copy_cut_count(void) { return g_copy_cuts; }
 
 // ---------- Clears a load action cannot express ----------
@@ -15070,7 +15136,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         if (f.error) { MLOG("[RED] display command buffer error: %s", f.error.description.UTF8String); gpu_lost_check(f.error, "display"); }
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; if (ticket > g_present_alloc_done[alloc_i]) g_present_alloc_done[alloc_i] = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv);
-        present_gpu_note(f.GPUEndTime - f.GPUStartTime, fx_kind); pthread_mutex_unlock(&g_pq_mu);
+        present_gpu_note(f.GPUEndTime - f.GPUStartTime, fx_kind); pthread_mutex_unlock(&g_pq_mu); cbt_gpu_end(f.GPUEndTime);
     }];
     id<MTL4CommandBuffer> buffers[] = {cb};
     pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
@@ -15456,15 +15522,16 @@ static uint64_t snap_take(const tex_t *t) {
     [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the game's next writes to its texture come after the copy
     [ce endEncoding]; [cb endCommandBuffer];
     uint64_t v = ++g_snap_v;
+    MTL4CommitOptions *so = nil; if (cbt_on()) { so = [MTL4CommitOptions new]; DmCbT *st = cbt_new(atomic_load(&g_cur_frame), so); [so addFeedbackHandler:^(id<MTL4CommitFeedback> f) { cbt_done(st, f.GPUStartTime, f.GPUEndTime); }]; }   // DM_NVN_TSV: timed like any command buffer
     if (rec_on() && g_rb_started) {   // a block of the encode thread's queue, behind the frame's work (see above)
         if (on_sub_thread()) rec_publish();   // what the submitting thread recorded outside a submission goes first
         rec_blk *b = rec_own_begin();
-        rec_t *r = rec_own_put(b, RO_COMMIT_REAL, 2); r->a[0] = 0; r->a[1] = rec_obj(cb);
+        rec_t *r = rec_own_put(b, RO_COMMIT_REAL, 2); r->a[0] = so ? rec_obj(so) : 0; r->a[1] = rec_obj(cb);
         r = rec_own_put(b, RO_SIGNAL, 1); r->a[0] = rec_obj(g_snap_ev); r->a[1] = v;
         r = rec_own_put(b, RO_NOTE, 0); r->a[0] = (uint64_t)(uintptr_t)&g_snap_cmt; r->a[1] = v;
         rec_own_push(b);
     } else {
-        pthread_mutex_lock(&g_res_mu); [g_q4 commit:&cb count:1]; [g_q4 signalEvent:g_snap_ev value:v]; pthread_mutex_unlock(&g_res_mu);
+        cbt_stamp(so); pthread_mutex_lock(&g_res_mu); if (so) [g_q4 commit:&cb count:1 options:so]; else [g_q4 commit:&cb count:1]; [g_q4 signalEvent:g_snap_ev value:v]; pthread_mutex_unlock(&g_res_mu);
         atomic_store(&g_snap_cmt, v);
     }
     g_snap[k].ev = v;
