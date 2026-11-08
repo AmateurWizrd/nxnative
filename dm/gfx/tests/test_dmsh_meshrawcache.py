@@ -154,15 +154,37 @@ class Structure(unittest.TestCase):
     def test_wrapper_runs_the_fast_body_then_the_exact_one_where_a_lane_missed(self):
         src, i = fixture()
         entry = src.split('[[mesh]] void main0(')[1].split('[[mesh]] void main0_z(')[0]
-        self.assertIn(f'device uint* dm_slot = (device uint*)dm_scr + ', entry)
-        self.assertIn('uint dm_s = simd_broadcast_first(*dm_slot), dm_bad = dm_s >> 13 & 15u;', entry)
+        self.assertIn('device atomic_uint* dm_slot = (device atomic_uint*)dm_scr + ', entry)
+        self.assertIn('uint dm_s = simd_broadcast_first(atomic_load_explicit(dm_slot, memory_order_relaxed)), dm_bad = dm_s >> 13 & 15u;', entry)
         self.assertRegex(entry, r'ulong3 dm_c = dm_entry\(\*spvDescriptorSet0\.cp_s3, dm_s\);\n    if \(dm_try\) dm_stage_body_f\(spvDescriptorSet0, gl_SubgroupInvocationID, _60, dm_c, dm_miss\);\n    if \(!simd_any\(dm_miss\)\)')
         after = entry.split('if (!simd_any(dm_miss))')[1].split('uint np =')[0]
         self.assertIn('dm_stage_body(spvDescriptorSet0, gl_SubgroupInvocationID, _60, dm_h0, dm_h1);', after)
         self.assertIn('((device uint4*)&_60[0])[i] = uint4(0u);', after)   # the stage memory zero again, and its inputs filled again, as at the start
         self.assertIn('_60[0] = dm_first[0] + dm_tg;', after)
-        self.assertIn('*dm_slot = (dm_n != 0u ? dm_n : dm_s & 8191u) | min(dm_bad + 1u, 9u) << 13;', after)   # the entry it ended on, and one more miss counted
+        self.assertIn('atomic_store_explicit(dm_slot, (dm_n != 0u ? dm_n : dm_s & 8191u) | min(dm_bad + 1u, 9u) << 13, memory_order_relaxed);', after)
+        self.assertIn('uint dm_n = simd_max(max(dm_h0, dm_h1));', after)   # the entry it ended on, and one more miss counted
         slot = int(re.search(r'dm_scr \+ (\d+);', entry)[1]); self.assertTrue(1 <= slot < abi.MESH_SCRATCH_HEAD // 4)   # not the ticket's word 0
+
+    def test_retry_cadence_is_the_global_ticket(self):   # a task-fed mesh grid restarts its group numbers with each task group: one group in 64 must count tickets, not those
+        src, _ = fixture()
+        entry = src.split('[[mesh]] void main0(')[1].split('[[mesh]] void main0_z(')[0]
+        self.assertIn('(dm_t & 63u) == 0u', entry); self.assertNotIn('dm_tg & 63u', entry)
+
+    def test_unused_table_entry_has_no_length(self):   # start ~0 and end 0 must not read as a one-byte range
+        self.assertIn('n > s ? n - s : 0ul', fixture()[0])
+
+    def test_small_integer_loads_are_refused(self):
+        for why, line in (('word address', '    int w = _a & -4;'), ('byte', '    int w = int(uint(_a) >> 8u) & 255;'), ('half', '    int w = _a & 65535;'), ('signed', '    int w = extract_bits(_a, 0, 8);')):
+            with self.subTest(why):
+                out = mini(1, small=line)
+                self.assertNotIn('dm_stage_body_f', out); self.assertIn('dm_stage_body(spvDescriptorSet0, gl_SubgroupInvocationID, _60);', out)
+
+    def test_hint_maximum_for_any_helper_count(self):   # Metal's max takes two arguments
+        for n, want in ((1, 'simd_max(dm_h0)'), (2, 'simd_max(max(dm_h0, dm_h1))'), (3, 'simd_max(max(max(dm_h0, dm_h1), dm_h2))')):
+            with self.subTest(n=n): self.assertIn(want, mini(n))
+
+    def test_table_not_passed_as_a_pointer_is_a_value_error(self):
+        with self.assertRaises(ValueError): mini(1, call='_80(lo, hi, spvDescriptorSet0_cp_s3, _4);')
 
     def test_table_entries_are_masked(self):   # the scratch word may hold anything: every value names one of the table's 8,192 entries
         self.assertIn('uint w = (e & 8191u) * 8u;', fixture()[0])
@@ -191,12 +213,35 @@ class Structure(unittest.TestCase):
         self.assertNotIn('dm_miss', ms.to_stage(HEAD + HELPERS + kernel, i))
 
 
+def scalar(n, h, small=''):
+    return ('static inline __attribute__((always_inline))\nint _%d(thread const int& _a, thread const int& _b, const device _27& cp_s3, thread uint& %s)\n{\n' % (n, h) +
+            small + LOOKUP % dict(lo='_a', hi='_b', h=h) + '    if (!holds) return 0;\n    ulong d = as_type<ulong>(uint2(cp_s3._m0[e * 8u + 4u], cp_s3._m0[e * 8u + 5u]));\n    uint v = *(const device uint*)(a + d);\n    return as_type<int>(v);\n}\n\n')
+
+
+def mini(n, small='', call=None):
+    """to_stage of a mesh shader with n scalar raw helpers (each with its own last-entry variable); small: a line of the first helper's body; call: the first call's text instead"""
+    i = ms.info(control(), sph()); size = ms.memory(i)[1]
+    names = [80 + k for k in range(n)]; hints = [40 + k for k in range(n)]
+    kernel = ('kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], uint gl_SubgroupInvocationID [[thread_index_in_simdgroup]])\n{\n'
+              f'    threadgroup spvUnsafeArray<uint, {size // 4}> _60;\n' + ''.join(f'    uint _{h} = 0u;\n' for h in hints) + '    int lo = int(_60[0]), hi = 0;\n' +
+              ''.join('    ' + (call if call and k == 0 else f'int w{k} = _{nm}(lo, hi, (*spvDescriptorSet0.cp_s3), _{h});') + '\n' for k, (nm, h) in enumerate(zip(names, hints))) +
+              ''.join(f'    _60[{k + 1}] = as_type<uint>(w{k});\n' for k in range(n)) + '}\n')
+    return ms.to_stage(HEAD + ''.join(scalar(nm, f'_{h}', small if k == 0 else '') for k, (nm, h) in enumerate(zip(names, hints))) + kernel, i)
+
+
 def have_metal():
     return shutil.which('xcrun') and subprocess.run(['xcrun', '-sdk', 'macosx', '-f', 'metal'], capture_output=True).returncode == 0 and shutil.which('clang')
 
 
 @unittest.skipUnless(have_metal(), 'no Metal compiler')
 class Compiles(unittest.TestCase):
+    def test_any_number_of_helpers_builds(self):   # a shader with one raw helper or three: the hint maximum must be valid Metal
+        with tempfile.TemporaryDirectory() as d:
+            for n in (1, 2, 3):
+                f = Path(d, f's{n}.metal'); src = mini(n); self.assertIn('dm_stage_body_f', src); f.write_text(src)
+                r = subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-target', 'air64-apple-macos15.0', '-c', str(f), '-o', str(f.with_suffix('.air'))], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, f'{n} helpers: {r.stderr[-1500:]}')
+
     def test_both_platforms(self):   # the iOS app takes the same stage: the SIMD-group functions and ulong3 compile there too
         with tempfile.TemporaryDirectory() as d:
             f = Path(d, 's.metal'); f.write_text(fixture()[0])

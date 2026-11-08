@@ -766,7 +766,8 @@ def ps_libraries(key, msl, full, bindings):
             try: build(split)
             except (subprocess.CalledProcessError, ValueError) as e:
                 if split == unit: raise
-                print(f'[RED] {key}: the border colour split does not build ({str(e)[:120]}): compiled without it', flush=True); build(unit)
+                build(unit); SIDE_STATS['split fallback'] += 1   # the RED line only once the unit builds without it: when it does not, the split was not the cause
+                print(f'[RED] {key}: the border colour split does not build ({str(e)[:120]}): compiled without it', flush=True)
         except (subprocess.CalledProcessError, ValueError) as e:
             if fetch: BF_STATS['failed'] += 1; print(f'[RED] {key}: the readable-tile version does not build ({str(e)[:120]}): its draws go without the tile read', flush=True)
             else: SIDE_STATS['failed'] += 1; print(f'[RED] {key}: the alpha test and logic operation entry points do not build ({str(e)[:120]}): its draws go without them', flush=True)
@@ -1708,12 +1709,14 @@ def finish(key, w, j, c1):
     src = border_emu(src)   # border colours Metal lacks (see border_emu)
     if j['stage'] == 'ps': src = frag_z_snap(src)[0]   # gl_FragCoord.z against a depth of its own surface (see frag_z_snap)
     open(msl, 'w').write(src)
-    first, spill = [], 0
+    first, spill, raw_plain = [], 0, None
     mesh = j.get('mesh_stage')
     if mesh:   # the kernel as the Metal object or mesh function (dmsh_meshstage.py)
         if mesh.get('refused'): return 'mesh stage failed', mesh['refused'], None
         # outputs its paired pixel shaders read but its SPHs do not enable get (0,0,0,1), as vs_pad gives a vertex shader's (Ocarina of Time's foliage meshes); each output as wide as they read
-        try: src = dmsh_meshstage.to_stage(src, mesh, partner_reads(key)); open(msl, 'w').write(src)
+        try:
+            pre = src; src = dmsh_meshstage.to_stage(pre, mesh, partner_reads(key)); open(msl, 'w').write(src)
+            if mesh.get('raw'): raw_plain = dmsh_meshstage.to_stage(pre, mesh, partner_reads(key), raw_cache=False)   # for when the stage with its raw load cache does not build
         except ValueError as e: return 'mesh stage failed', str(e)[:160], None
     elif j['stage'] == 'cs':
         src, first = first_store(src, j.get('local')); open(msl, 'w').write(src)   # the first invocation's store, for the host (see first_store)
@@ -1754,12 +1757,15 @@ def finish(key, w, j, c1):
         if 'ios' in TARGETS and IOSOUT: MTL.compile('ios', msl, os.path.join(IOSOUT, key + '_b.metallib'))
     try: compile_targets()
     except subprocess.CalledProcessError as e:
-        if not lay and not fu and not fd and cs == src: return 'metal failed', str(e)[:160], None
+        if not lay and not fu and not fd and cs == src and not raw_plain: return 'metal failed', str(e)[:160], None
         lost = [name for name, extra in (('layer', lay), ('integer output', fu), ('dual source', fd)) if extra]   # kept in the reflection, as a cache hit compiles nothing: every build reports it (shader_regressions.report_losses)
-        if cs != src: print(f'[RED] {key}: the border colour split does not build ({str(e)[:120]}): compiled without it', flush=True)
-        open(msl, 'w').write(plain); lay = fu = fd = None; cs = src   # the layer, integer-output and dual-source entry points are extras: a library that does not build with them is built without
+        err, was_split = str(e)[:120], cs != src
+        open(msl, 'w').write(raw_plain or plain); lay = fu = fd = None; cs = src   # the layer, integer-output and dual-source entry points are extras: a library that does not build with them is built without
+        if raw_plain: src = raw_plain
         try: compile_targets()
         except subprocess.CalledProcessError as e: return 'metal failed', str(e)[:160], None
+        if was_split: SIDE_STATS['split fallback'] += 1; print(f'[RED] {key}: the border colour split does not build ({err}): compiled without it', flush=True)
+        if raw_plain: SIDE_STATS['raw cache fallback'] += 1; print(f'[RED] {key}: the mesh stage with its raw load cache does not build ({err}): compiled without it', flush=True)
     clone(msl, os.path.join(out, key + '_b.metal'))
     entry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', src)
     dr = drv_reads(src)
@@ -1958,6 +1964,7 @@ print(f'readable-tile versions (<key>_bf, dmsh_fetch.py): {BF_STATS["generated"]
 print(f'shadow-input libraries (<key>_bv, dmsh_vin.py): {VIN_STATS["generated"]} generated, {VIN_STATS["failed"]} failed to compile, {VIN_STATS["not generated"]} not generated; '
       f'{VIN_STATS["inputs"]} integer inputs shadowed, {VIN_STATS["float only"]} of them with no other-sign shadow (attribute indices ran out)')
 print(f'alpha test and logic operation libraries (<key>_bx, dmsh_side.py): {SIDE_STATS["generated"]} generated, {SIDE_STATS["failed"]} failed to compile, {SIDE_STATS["not generated"]} pixel shaders without either')
+print(f'compiled without their split or cache for want of a build: {SIDE_STATS["split fallback"]} border colour splits (border_split), {SIDE_STATS["raw cache fallback"]} mesh raw load caches (dmsh_meshstage.py _raw_cache)')
 print(f'pulling libraries (<key>_bp, dmsh_pull.py): {PULL_STATS["generated"]} generated, {PULL_STATS["failed"]} failed to compile, {PULL_STATS["not generated"]} not generated, '
       f'{PULL_STATS["no stage input"]} vertex shaders without stage inputs (none needed)')
 print('mesh libraries (<vertex>_<geometry>_m3, dmsh_mesh.py): ' + (', '.join(f'{k} {v}' for k, v in MESH_STATS.items()) or 'none'))

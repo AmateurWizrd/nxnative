@@ -17,6 +17,7 @@ threadgroups (nvn_geometry.inc mtk_encode). The task and object functions read t
                 primitives (the components the per-primitive SPH's OMAP enables, 0x80 bytes each, a word per primitive)
   primitives    a mesh shader's primitive bytes: the count at +3 (0x88), index bytes from +4 (0x80, control +0x5f per primitive: 1 point, 2 line, 3 triangle)
 """
+import functools
 import re
 import struct
 import zlib
@@ -150,6 +151,7 @@ def _device(msl):   # twin of the rewrite at the end of dmsh_build.py tg_spill: 
 # 128-bit load, and its body, which holds the 2 MiB chunk hint (>> uint(21))
 RAW_BAD_SHIFT, RAW_BAD_LIMIT, RAW_RETRY = 13, 8, 64   # the scratch word: the entry in its low 13 bits, above them a count of the groups that missed (15 at most); from RAW_BAD_LIMIT on a shader's groups run the exact body alone, and one group in RAW_RETRY tries again
 _RAW_LOAD = re.compile(r'^int (_\d+)\(thread const int& (\w+), thread const int& (\w+), const device (_\d+)& (cp_s\d+), thread uint& (\w+)(?:, thread spvUnsafeArray<uint, 3>& (\w+))?\)\n\{\n(.*?)^\}\n', re.M | re.S)
+_SMALL_INT = re.compile(r'extract_bits|&\s*\(?\s*(?:-4|255u?|65535u?|4294967292u|0xff|0xffff|0xfffffffc)\b')   # a U8/S8/U16/S16 load's word address (& ~3) and bit extract, as GlobalToStorage.EmitAccess emits them
 
 
 def _raw_cache(src, names, mem):
@@ -164,6 +166,7 @@ def _raw_cache(src, names, mem):
     no atomic, no write to a storage buffer, image or raw pointer, no other function with the lookup's shape. → (the source with dm_stage_body_f, the fast body, and dm_stage_body, the exact one
     taking its last entries as parameters; the call of the fast one; block(...) the wrapper's code that runs them), or None"""
     loads = [m for m in _RAW_LOAD.finditer(src) if 'uint(21)' in m[8]]
+    if any(_SMALL_INT.search(m[8]) for m in loads): return None   # a U8/S8/U16/S16 load reads the word at addr & -4 and extracts its bits: the fast helper returns the unaligned word whole, so it stays exact
     at = src.find('static inline __attribute__((always_inline)) void dm_stage_body(')
     if not loads or at < 0: return None
     head, body = src[:at], src[at:]
@@ -196,26 +199,29 @@ def _raw_cache(src, names, mem):
     sbody = end(sbody, ', '.join(f'thread uint& {h}' for h in hints))
     entry = (f'static inline ulong3 dm_entry(const device {ty}& {cp}, uint e)\n{{\n    uint w = (e & 8191u) * 8u;\n'   # the table's 8,192 entries: a word of any value names a real one
              f'    ulong s = as_type<ulong>(uint2({cp}._m0[w], {cp}._m0[w + 1u])), n = as_type<ulong>(uint2({cp}._m0[w + 2u], {cp}._m0[w + 3u])), d = as_type<ulong>(uint2({cp}._m0[w + 4u], {cp}._m0[w + 5u]));\n'
-             '    return ulong3(s, n - s, s + d);\n}\n\n')
+             '    return ulong3(s, n > s ? n - s : 0ul, s + d);\n}\n\n')   # an unused entry holds start ~0, end 0: no length, never a hit
     slot = 1 + zlib.crc32(src.encode()) % (abi.MESH_SCRATCH_HEAD // 4 - 1)   # a word of the head after the ticket's: this shader's
-    table = re.search(r'\((\*\w+\.%s)\)' % cp, body)[1]   # the table as the calls name it: (*spvDescriptorSet0.cp_s3)
+    found = re.search(r'\((\*\w+\.%s)\)' % cp, body)   # the table as the calls name it: (*spvDescriptorSet0.cp_s3)
+    if not found: raise ValueError(f'ms: a raw load of {cp} that does not pass the table as (*...{cp})')
+    table = found[1]
 
-    def block(names, mem, lid, tg, bar, zero, fill, call):
-        hs = ", ".join(f"dm_h{k}" for k in range(len(hints)))
+    def block(names, mem, lid, bar, zero, fill, call):
+        hs = [f"dm_h{k}" for k in range(len(hints))]
+        top = functools.reduce(lambda a, b: f'max({a}, {b})', hs)   # Metal's max takes two
         fcall = call.replace("dm_stage_body(", "dm_stage_body_f(").replace(");", ", dm_c, dm_miss);")
-        return (f'    device uint* dm_slot = (device uint*)dm_scr + {slot};\n'
-                f'    uint dm_s = simd_broadcast_first(*dm_slot), dm_bad = dm_s >> {RAW_BAD_SHIFT} & 15u;\n'   # one value for the whole SIMD-group
-                f'    bool dm_try = dm_bad < {RAW_BAD_LIMIT}u || ({tg} & {RAW_RETRY - 1}u) == 0u, dm_miss = !dm_try;\n'
+        return (f'    device atomic_uint* dm_slot = (device atomic_uint*)dm_scr + {slot};\n'
+                f'    uint dm_s = simd_broadcast_first(atomic_load_explicit(dm_slot, memory_order_relaxed)), dm_bad = dm_s >> {RAW_BAD_SHIFT} & 15u;\n'   # one value for the whole SIMD-group
+                f'    bool dm_try = dm_bad < {RAW_BAD_LIMIT}u || (dm_t & {RAW_RETRY - 1}u) == 0u, dm_miss = !dm_try;\n'   # dm_t: the global ticket, so one group in RAW_RETRY whatever the grid
                 f'    ulong3 dm_c = dm_entry({table}, dm_s);\n    if (dm_try) {fcall}\n'
-                f'    if (!simd_any(dm_miss))\n    {{\n        if (dm_try && dm_bad != 0u && {lid} == 0u) *dm_slot = (dm_s & 8191u) | (dm_bad - 1u) << {RAW_BAD_SHIFT};\n    }}\n'
+                f'    if (!simd_any(dm_miss))\n    {{\n        if (dm_try && dm_bad != 0u && {lid} == 0u) atomic_store_explicit(dm_slot, (dm_s & 8191u) | (dm_bad - 1u) << {RAW_BAD_SHIFT}, memory_order_relaxed);\n    }}\n'
                 f'    else\n    {{\n        if (dm_try)\n        {{\n            threadgroup_barrier({bar});\n{zero}            threadgroup_barrier({bar});\n{fill}            threadgroup_barrier({bar});\n        }}\n'
-                f'        uint {", ".join(f"dm_h{k} = 0u" for k in range(len(hints)))};\n        {call.replace(");", ", " + hs + ");")}\n        threadgroup_barrier({bar});\n'
-                f'        uint dm_n = simd_max(max({hs}));\n'
-                f'        if (dm_try && {lid} == 0u) *dm_slot = (dm_n != 0u ? dm_n : dm_s & 8191u) | min(dm_bad + 1u, {RAW_BAD_LIMIT + 1}u) << {RAW_BAD_SHIFT};\n    }}\n')
+                f'        uint {", ".join(f"{h} = 0u" for h in hs)};\n        {call.replace(");", ", " + ", ".join(hs) + ");")}\n        threadgroup_barrier({bar});\n'
+                f'        uint dm_n = simd_max({top});\n'
+                f'        if (dm_try && {lid} == 0u) atomic_store_explicit(dm_slot, (dm_n != 0u ? dm_n : dm_s & 8191u) | min(dm_bad + 1u, {RAW_BAD_LIMIT + 1}u) << {RAW_BAD_SHIFT}, memory_order_relaxed);\n    }}\n')
     return SimpleNamespace(src=head + fast + entry + fbody + '\n' + sbody, call=f'dm_stage_body({", ".join(names + [mem])});', block=block)
 
 
-def to_stage(msl, i, reads=None):
+def to_stage(msl, i, reads=None, raw_cache=True):
     """The translated kernel as the object function main0 (kind 'ts'), or the mesh functions main0 and main0_z (kind 'ms': the two depth conventions, as dmsh_build.py vs_depth gives a
     vertex shader, near = -w and near = 0). reads: {user(locnN) location: component mask} of what a mesh shader's paired pixel shaders read (pixel_reads), None when not known.
     A location its SPHs do not enable becomes a vertex output of (0,0,0,1), what the hardware gives a pixel shader input no stage wrote (dmsh_build.py vs_pad does the same for a
@@ -237,7 +243,8 @@ def to_stage(msl, i, reads=None):
         i['spill'] = 1   # the build writes the reflection's mesh_spill from it: the host binds the scratch buffer at abi.MESH_SCRATCH_SLOT
         src = _device(src)
     call = f'dm_stage_body({", ".join(names + [mem])});'
-    raw = _raw_cache(src, names, mem) if spill else None
+    raw = _raw_cache(src, names, mem) if spill and raw_cache else None
+    i['raw'] = int(bool(raw))   # the build compiles the stage again without it when this one does not build (dmsh_build.py finish)
     if raw: src, call = raw.src, raw.call
     # The thread's and the threadgroup's numbers: the kernel's parameters where it has them (an attribute may appear once in a function), else parameters of the wrapper's own
     own = {t[3]: t[2] + ('.x' if t[1] == 'uint3' else '') for t in map(_THREAD.match, params) if t}
@@ -313,7 +320,7 @@ def to_stage(msl, i, reads=None):
                 f'    if ({lid} == 0u) {{ {mem}[{wg}] = {tg}; {mem}[{inp}] = {tg}; }}\n') if i['task'] else f'    if ({lid} == 0u) {mem}[{wg}] = dm_block.first + {tg};\n'
         return (f'[[mesh]] void {name}({sig}, dm_mesh_t dm_out' + (', const object_data dm_payload_t& dm_payload [[payload]]' if i['task'] else ', const object_data dm_block_t& dm_block [[payload]]') +
                 scr + f')\n{{\n{start}{fill}'
-                f'    threadgroup_barrier({bar});\n' + (raw.block(names, mem, lid, tg, bar, zero, fill, call) if raw else f'    {call}\n') + f'    threadgroup_barrier({bar});\n'
+                f'    threadgroup_barrier({bar});\n' + (raw.block(names, mem, lid, bar, zero, fill, call) if raw else f'    {call}\n') + f'    threadgroup_barrier({bar});\n'
                 f'    uint np = min({mem}[{prim >> 2}] >> 24, {max_p}u);\n'
                 f'    if ({lid} == 0u) dm_out.set_primitive_count(np);\n'
                 f'    for (uint n = {lid}; n < {max_v}u; n += {thr}u)\n    {{\n        uint b = {v_block("n")};\n        dm_vertex_t v;\n{sets}' +
