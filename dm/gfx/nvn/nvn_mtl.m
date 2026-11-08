@@ -5534,6 +5534,7 @@ static void shmap_read(void) {
     NSString *ventry; id<MTLFunction> vfn; int vfn_state;
     id<MTLFunction> pfn; int pfn_state, has_pull;
     id<MTLFunction> afn[4]; int afn_state, has_alpha;
+    id<MTLLibrary> bslib; int bslib_state, has_bs;   // bslib: the border color twins' library <key>_bs (bs_fn; bslib_state as afn_state); has_bs: the reflection declares it (border_twin, dmsh_build.py): the entry points here have no border color correction, the twins' have
     id<MTLLibrary> llib; NSMutableDictionary<NSNumber *, id<MTLFunction>> *lfn; int lfn_state, has_logic; } @end   // llib: the side library <key>_bx for logic operations, lfn: its fn_u / fn_m specialized per set of targets (lo_fn; lfn_state as afn_state; has_logic: the reflection names its entry points, dmsh_logic.py)   // afn: the alpha test entry points of fn, fn_u, fn_m, fn_d in the side library <key>_bx (at_fn; afn_state 0 untried, 1 loaded, 2 failed; has_alpha: the reflection names them, dmsh_alpha.py)   // pfn: the same entry of the pulling library <key>_bp (pull_fn; has_pull: the reflection names one, dmsh_pull.py)   // vertex: the entry point loaded (by the depth mode); vfn: the same entry of the shadow-input library <key>_bv (vin_fn; state 0 untried, 1 loaded, 2 failed)
 @implementation NvShader
 - (void)dealloc { free(rf.c1); free(geo_slot); }
@@ -5800,6 +5801,7 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     if (stage == 0 && !layer) o->has_pull = [j[@"pull"] isKindOfClass:[NSDictionary class]];
     if (stage == 1) o->has_alpha = [j[@"alpha"] isKindOfClass:[NSDictionary class]];
     if (stage == 1) o->has_logic = [j[@"logic"] isKindOfClass:[NSDictionary class]];
+    if (stage == 1) o->has_bs = [j[@"border_twin"] isEqual:@DMSH_BORDER_FN];
     // A function that declares function constants cannot go into a pipeline until it is specialized, even when every constant is optional. SPIRV-Cross declares one for shaders that read a
     // texel buffer (spvLinearTextureAlignmentOverride, used only through is_function_constant_defined; one of Pokémon Legends: Z-A's imgui pixel shaders, 2bd5037003980716): an empty set of
     // values keeps its default. Without it the first pipeline with that shader failed Metal's validation (`fragmentFunction main0 cannot be used to build a pipeline state`)
@@ -7509,6 +7511,36 @@ static int pso_mixed_uint(const pso_key *k, NvShader *fs, int merged) {
     }
     return ints && floats;
 }
+// Border color twins (dmsh_build.py border_twin): a shader that samples through samplers Metal has no border color for has its entry points built without the correction, and each one's twin
+// <entry>_bs with it, in the library <key>_bs. A draw takes the twin only when one of its samplers needs the correction (bs_key, kept in pso_key.bs): nearly every draw takes the plain entry
+// point, whose pipeline has no correction code in it. The twin of any function pso_desc chose (the integer-output, dual-source, readable-tile, alpha test and logic operation ones too) is the entry
+// point of that name with the suffix, specialized with the same constants. Its pipeline is built when first drawn (the pipeline archive holds the plain ones) and its prewarm row names it
+static os_unfair_lock g_bs_lock = OS_UNFAIR_LOCK_INIT; static NSMapTable *g_bs_fn;   // a function made from a shader's libraries → its twin (NSNull: it has none)
+static id<MTLFunction> bs_fn(NvShader *fs, id<MTLFunction> f) {   // f's twin, the library loaded on first need; nil for a function that is not one of fs's, and for a twin that cannot be used (a red line: the draw goes without the correction)
+    MTL4FunctionDescriptor *d = fn4_of(f);
+    if (!d || !fs->has_bs) return nil;
+    MTL4SpecializedFunctionDescriptor *sd = [d isKindOfClass:MTL4SpecializedFunctionDescriptor.class] ? (MTL4SpecializedFunctionDescriptor *)d : nil;
+    NSString *name = [(MTL4LibraryFunctionDescriptor *)(sd ? sd.functionDescriptor : d) name];
+    os_unfair_lock_lock(&g_bs_lock);
+    id c = [g_bs_fn objectForKey:f];
+    if (!c) {
+        if (!g_bs_fn) g_bs_fn = [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory capacity:0];
+        NSError *e = nil; const char *why = NULL; id<MTLFunction> t = nil;
+        if (!fs->bslib_state) {
+            size_t kl = strlen(fs->key); NSString *path = [NSString stringWithFormat:@"%@/%.*s" DMSH_BORDER_FN ".metallib", g_msl_dir, (int)(kl > 2 ? kl - 2 : kl), fs->key];
+            fs->bslib = lib_from_file(path, &e); fs->bslib_state = fs->bslib ? 1 : 2;
+        }
+        NSString *twin = [name stringByAppendingString:@DMSH_BORDER_FN];
+        if (!fs->bslib) why = "no library";
+        else if (!(t = fn_spec(fs->bslib, twin, sd ? sd.constantValues : [MTLFunctionConstantValues new], &e))) why = "no entry point";
+        else if (fs->rf.nb && [t newArgumentEncoderWithBufferIndex:fs->rf.abi].encodedLength != fs->arg_len) { why = "its argument buffer differs from the base library's"; t = nil; }
+        if (why) { static int n; if (n++ < 8) MLOG("[RED] border color twin %s of %s not usable (%s%s%s): a draw that needs the correction goes without it", twin.UTF8String, fs->key, why, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); }
+        else { static int n; if (++n <= 8 || !(n & (n - 1))) MLOG("border color correction: %s of %s loaded (%d twins so far)", twin.UTF8String, fs->key, n); }
+        c = t ? (id)t : (id)NSNull.null; [g_bs_fn setObject:c forKey:f];
+    }
+    os_unfair_lock_unlock(&g_bs_lock);
+    return c == NSNull.null ? nil : c;
+}
 // NVN's alpha test (ColorStateSetAlphaTest and SetAlphaRef; Maxwell's fixed-function test of the alpha a pixel shader writes to colour 0, before blending): Metal has none.
 // A pipeline drawn with an alpha function other than ALWAYS takes its fragment from the shader's side library <key>_bx (dmsh_alpha.py: <entry>_a runs the body and compares
 // colour 0's alpha with the function and reference at fragment buffer DMSH_ALPHA_BUFFER), and its draws bind them there (at_bind). The function and the
@@ -7696,6 +7728,7 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
         if (lf) d.fragmentFunction = lf;
         else if (fsfn) RED_ONCE(136, "logic operation not applied to a specialized fragment (readable-tile merge or diagnostic) of %s", fs->key);
     }
+    if (k->bs && fs) { id<MTLFunction> bf = bs_fn(fs, d.fragmentFunction); if (bf) d.fragmentFunction = bf; }   // a sampler of the draw needs the border color correction (bs_key): the twin of the function chosen above
     if (vs && (k->fsfn == TF_MARK || k->fsfn == GEO_MARK || k->fsfn == DISCARD_MARK)) { d.fragmentFunction = nil; d.rasterizationEnabled = NO; }
     d.rasterSampleCount = k->samples ? k->samples : 1;
     d.alphaToCoverageEnabled = k->a2c;
@@ -8345,6 +8378,7 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, N
     return ps;
 }
 static id<MTLRenderPipelineState> pso_build(MTLRenderPipelineDescriptor *d, NSError **e) { return pso_build_ex(d, e, 1); }
+static uint32_t bs_key(NvShader *fs);   // defined with encode_args, whose sampler lookups it repeats
 // Pipeline key: current state S + pass formats (normal pass; a merged pass additionally carries lmap / specialized function, filled in by pso_get)
 static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t cfmt[8], uint32_t dfmt, uint32_t sfmt, uint32_t samples, int lmap) {
     memset(k, 0, sizeof *k);
@@ -8352,7 +8386,7 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
     memcpy(k->cfmt, cfmt, sizeof k->cfmt); k->dfmt = dfmt; k->sfmt = sfmt; k->samples = samples;
     k->blend_en = S.color.blend_en; k->chmask = S.chmask.mask; k->a2c = S.ms.a2c; k->atest = atest_key(fs, cfmt, lmap ? g_pso_lmap : NULL);
     for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) k->blend[i] = S.blend[i];
-    k->logic = lop_key(k, fs, lmap);
+    k->logic = lop_key(k, fs, lmap); k->bs = bs_key(fs);
     const nvn_refl *rf = &vs->rf;
     for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 32 && a < S.nattr) { if (a < 16) k->attr[a] = S.attr[a]; else k->attr_hi[a - 16] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
     pso_key_norm(k, lmap);
@@ -8974,6 +9008,7 @@ static void warm_task(WarmTask *t) {
                 if (sk.fz_desc.kind == 1 && fs) { int fx[32]; for (int i = 0; i < 32; i++) fx[i] = sk.fz_desc.fx[i]; fsfn = bf_fn(fs, fx, sk.fz_desc.fbmask, sk.k.lmap); }
                 if (!fsfn) { g_warm_skip_fz++; g_warm_done++; continue; }
             }
+            if (sk.k.bs && !(fs && fs->has_bs)) { g_warm_done++; continue; }   // a row from a chain whose shader had twins and this one has none: no draw makes that key
             pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn;   // pso_skey_parse normalized rows written before the key was
             NSError *e = nil; id ps = pso_build(pso_desc(&k, vs, fs, fsfn, sk.merged), &e);
             if (!ps && !vs->layer_out && [e.localizedDescription containsString:@"render_target_array_index"]) {   // a vertex shader that writes the layer (see pso_get_)
@@ -9817,6 +9852,24 @@ static int sampu_id(int stage, const nvn_rbind *b, int k) {
     if (b->soff && b->sreg == DMSH_SREG_C2) return (int)(c2_handle(stage, b->soff - 1u) >> 20);
     return k < 0 ? ubo_samp_id(ubo_bind_handle(stage, b)) : ubo_samp_id(ubo_handle(stage, b->reg, b->off + 8 * k));
 }
+// The sampler ID a sampler binding of stage names now (SAMPT: the sampler part of a combined handle, texture ID | sampler ID << 20; SAMPU: the same, with the handle in a uniform buffer; SAMPI: a sampler ID the shader names as a constant)
+static int samp_bind_id(int stage, const nvn_rbind *b) {
+    int reg = b->reg;
+    return b->kind == NVN_RB_SAMPU ? sampu_id(stage, b, -1) : b->kind == NVN_RB_SAMPI ? reg : b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(S.tex[stage][reg] >> 20) : 0) : reg < 128 ? (int)(S.samp[stage][reg] >> 20) : 0;
+}
+// pso_key.bs: 1 when fs has border color twins (has_bs) and one of its sampler bindings names a sampler whose twin the draw needs, which is what sets a bit of the block's mask in encode_args
+// (a twin binding of a sampler whose color Metal lacks and whose wrap mode reaches the border, g_sview_w); 0 for a draw that corrects nothing, whose pipeline has no correction in it (bs_fn)
+static uint32_t bs_key(NvShader *fs) {
+    if (!fs || !fs->has_bs) return 0;
+    uint32_t need = 0;
+    os_unfair_lock_lock(&g_rmu);
+    for (int i = 0; i < fs->rf.nb && !need; i++) {
+        const nvn_rbind *b = &fs->rf.b[i]; int sid;
+        if (b->bw && (sid = samp_bind_id(1, b)) > 0 && sid < g_nsreg && samp_fast(sid) && g_sview_w[sid]) need = 1;
+    }
+    os_unfair_lock_unlock(&g_rmu);
+    return need;
+}
 // A table of the handles in one of the game's uniform buffers, which a shader indexes at run time (element k = the handle at off + 8k): nothing tells how many the game keeps there, and the argument
 // buffer has one pointer for it, so the table is as long as the last handle the buffer holds. Kirby Air Riders keeps 197 handles up to element 392 in a 4,096-element buffer, and 34,000 textures
 // registered: only those a table names are made here, where pool_gpu's walk over every ID took 16 GB and most of the frame. A table is looked at again in each pass, and rebuilt when the handles or the
@@ -10021,8 +10074,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             }
             if (!(sh->logged & 4)) { sh->logged |= 4; static int nlog; if (nlog++ < 32) MLOG("shader %s (stage %d): an array of %d handles in uniform slot %d, elements %#llx hold textures", sh->key, nvn_stage, b->n, reg, (unsigned long long)real); }
         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT || b->kind == NVN_RB_SAMPU || b->kind == NVN_RB_SAMPI) {   // SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20); SAMPU: the same, with the handle in a uniform buffer
-            int sid = b->kind == NVN_RB_SAMPU ? sampu_id(nvn_stage, b, -1) :
-                      b->kind == NVN_RB_SAMPI ? (int)reg : b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(S.tex[nvn_stage][reg] >> 20) : 0) : reg < 128 ? (int)(S.samp[nvn_stage][reg] >> 20) : 0;   // SAMPI: a sampler ID the shader names as a constant
+            int sid = samp_bind_id(nvn_stage, b);
             __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
             if (b->bw && ss && g_sview_w[sid]) {   // a twin (dmsh_build.py border_emu) of a sampler whose border colour Metal lacks: the shader corrects its samples
                 ss = (__bridge id<MTLSamplerState>)g_sview_w[sid]; slots[aid] = g_srid_w[sid];

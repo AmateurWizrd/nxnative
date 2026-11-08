@@ -1,4 +1,5 @@
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include "nvn_obj.h"
@@ -11,6 +12,7 @@ typedef struct {
     uint32_t atest, logic;   // atest: 1 = drawn with the alpha test, the fragment from the shader's side library <key>_bx (nvn_mtl.m atest_key); last, so a prewarm row written before it reads as 0
                              // logic: 1 = drawn with a logic operation, the fragment from the side library <key>_bx (lop_key); in what was padding (0 in older rows)
     va_st attr_hi[16];       // NVN2's attributes 16 to 31 (pso_key_attr); last, so a prewarm row written before them reads as 0
+    uint32_t bs;             // 1 = the fragment from the shader's border color twins <key>_bs (nvn_mtl.m bs_key: a sampler of the draw needs a correction); last, so a row written before it reads as 0
 } pso_key;
 static inline va_st pso_key_attr(const pso_key *k, int a) { return a < 16 ? k->attr[a] : k->attr_hi[a - 16]; }
 
@@ -51,8 +53,8 @@ static inline void pso_skey_hex(const pso_skey *key, char *out) {
 }
 
 static inline int pso_skey_parse(const char *hex, pso_skey *out) {
-    size_t n = sizeof *out * 2, old1 = n - 2 * sizeof out->k.attr_hi, old = old1 - 2 * (sizeof out->k.atest + sizeof out->k.logic);   // a row from before the high attributes, or also before the alpha test field: the key without them
-    if (!hex || (strlen(hex) != n && strlen(hex) != old1 && strlen(hex) != old)) return -1;
+    size_t n = sizeof *out * 2, old2 = 2 * offsetof(pso_skey, k.bs), old1 = old2 - 2 * sizeof out->k.attr_hi, old = old1 - 2 * (sizeof out->k.atest + sizeof out->k.logic);   // a row from before the border twins, or also before the high attributes, or also before the alpha test field: the key without them
+    if (!hex || (strlen(hex) != n && strlen(hex) != old2 && strlen(hex) != old1 && strlen(hex) != old)) return -1;
     if (strlen(hex) != n) { n = strlen(hex); memset(out, 0, sizeof *out); }
     uint8_t *p = (uint8_t *)out;
     for (size_t i = 0; i < n; i += 2) {

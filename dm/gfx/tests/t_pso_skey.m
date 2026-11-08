@@ -11,6 +11,7 @@ static void fill(pso_key *k, unsigned seed) {
     memset(k, 0, sizeof *k);
     for (size_t i = 0; i < sizeof *k; i++) ((unsigned char *)k)[i] = (unsigned char)(seed + i * 13);
     k->vs = (void *)1; k->fs = (void *)2; k->fsfn = (void *)3;
+    memset((char *)&k->bs + sizeof k->bs, 0, sizeof *k - offsetof(pso_key, bs) - sizeof k->bs);   // production keys have zero padding (pso_key_fill's memset)
 }
 
 int main(void) {
@@ -33,9 +34,9 @@ int main(void) {
         NvShader *vs = [NvShader new]; snprintf(vs->key, sizeof vs->key, "vs-a");
         pso_skey a, b; char hex[sizeof a * 2 + 1];
         pso_skey_from(&k, vs, nil, 0, NULL, &a); pso_skey_hex(&a, hex);
-        size_t old = strlen(hex) - 2 * (sizeof k.attr_hi + sizeof k.atest + sizeof k.logic); hex[old] = 0;
+        size_t old = 2 * offsetof(pso_skey, k.atest); hex[old] = 0;
         assert(pso_skey_parse(hex, &b) == 0); assert(b.k.atest == 0 && b.k.logic == 0);
-        a.k.atest = a.k.logic = 0; memset(a.k.attr_hi, 0, sizeof a.k.attr_hi); assert(memcmp(&a, &b, sizeof a) == 0);
+        a.k.atest = a.k.logic = 0; a.k.bs = 0; memset(a.k.attr_hi, 0, sizeof a.k.attr_hi); assert(memcmp(&a, &b, sizeof a) == 0);
     }
     // A row written before pso_key.attr_hi (NVN2's vertex attributes 16 to 31): they read as 0, the fields before them stay
     {
@@ -43,9 +44,20 @@ int main(void) {
         NvShader *vs = [NvShader new]; snprintf(vs->key, sizeof vs->key, "vs-h");
         pso_skey a, b; char hex[sizeof a * 2 + 1];
         pso_skey_from(&k, vs, nil, 0, NULL, &a); pso_skey_hex(&a, hex);
-        hex[strlen(hex) - 2 * sizeof k.attr_hi] = 0;
+        hex[2 * offsetof(pso_skey, k.attr_hi)] = 0;
         assert(pso_skey_parse(hex, &b) == 0); assert(b.k.atest == 1 && b.k.logic == 1);
-        memset(a.k.attr_hi, 0, sizeof a.k.attr_hi); assert(memcmp(&a, &b, sizeof a) == 0);   // NOLINT(bugprone-suspicious-memory-comparison): the key is defined byte by byte, padding included: pso_skey_from clears it and its hex form is every byte
+        a.k.bs = 0; memset(a.k.attr_hi, 0, sizeof a.k.attr_hi); assert(memcmp(&a, &b, sizeof a) == 0);   // NOLINT(bugprone-suspicious-memory-comparison): the key is defined byte by byte, padding included: pso_skey_from clears it and its hex form is every byte
+    }
+    // A row written before pso_key.bs (the border color twins): the draw took the plain entry points, so it reads as 0 and the fields before it stay; with bs set the row keeps it
+    {
+        pso_key k; fill(&k, 13); k.atest = 1; k.bs = 1; pso_key_norm(&k, 0);
+        NvShader *vs = [NvShader new]; snprintf(vs->key, sizeof vs->key, "vs-b");
+        pso_skey a, b, c; char hex[sizeof a * 2 + 1];
+        pso_skey_from(&k, vs, nil, 0, NULL, &a); pso_skey_hex(&a, hex);
+        assert(pso_skey_parse(hex, &c) == 0 && c.k.bs == 1 && memcmp(&a, &c, sizeof a) == 0);
+        hex[2 * offsetof(pso_skey, k.bs)] = 0;
+        assert(pso_skey_parse(hex, &b) == 0); assert(b.k.bs == 0 && b.k.atest == 1 && memcmp(&b.k.attr_hi, &a.k.attr_hi, sizeof a.k.attr_hi) == 0);
+        a.k.bs = 0; assert(memcmp(&a, &b, sizeof a) == 0);   // NOLINT(bugprone-suspicious-memory-comparison): as above
     }
     // pso_key_attr: attribute 16 is the first of the high table
     {

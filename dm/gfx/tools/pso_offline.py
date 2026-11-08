@@ -10,6 +10,8 @@
 #     through a base every primitive reads 0), a missing library or entry point
 #   · a pair whose functions declare function constants is left to the device (rest_pairs.tsv): the host specializes such functions with an empty set of values, and metal-tt makes
 #     no specialized function from a library (applegpu-nt: "cannot find private metadata"), nor the function unspecialized ("cannot lower module with unresolved function constants")
+#   · the entry point is the plain one, which a shader with border color twins (<key>_bs, dmsh_build.py border_twin) has without the correction: a draw whose samplers need it takes the twin
+#     (nvn_mtl.m bs_fn, pso_key.bs), whose pipeline the device builds on its first use and lists in pso_user.tsv for the next start's prewarm
 # And a compute pipeline per compute shader, which depends on its function alone (the host makes it from the function, cps_new in nvn_mtl.m; the threadgroup size is the dispatch's):
 # the C rows of the profile's prewarm list (pso_manifest.tsv, recorded, in order), then every compute shader of its shader map (shader_map.tsv, stage compute), so a game whose list
 # names none (a provisional profile) still has them; per shader <key>_b, entry `entry`. Left out as the host would not find them: a reflection of another chain version or none, a

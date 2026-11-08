@@ -1,7 +1,9 @@
 // Border colours Metal has no sampler state for (nvn_border.h, dmsh_build.py border_emu): nvn_border's choice of Metal colours and factors, the production sampler registry's twin
 // (mtl_reg_samp, samp_by_id), and, given the path of a shader border_emu rewrote (test_dmsh_border.py writes it), the GPU: samples through the sampler, its twin and the block come
 // out as Maxwell's do, bilinear between the texels and the border colour, and with the block's mask clear as Metal's nearest colour. A second path is a shader that must give the same
-// samples bit for bit (the first one after border_split)
+// samples bit for bit (the first one after border_split, a kernel's body twice). Given a directory (test_dmsh_border.py --fixture) it draws the border twins (border_twin): a pixel
+// shader's pipeline for a draw that needs no correction has none in it, a draw that does takes the twin (the alpha test's entry point has its twin too), the pixels are those of the shader as
+// it was, and the twin's pipeline is named in pso_user.tsv
 #include "../nvn/nvn_mtl.m"
 uint64_t g_t0_ns;
 int dm_guest_as_contains(uintptr_t address) { (void)address; return 0; }
@@ -76,6 +78,105 @@ static id<MTLComputePipelineState> pipeline(const char *path) {
     return p;
 }
 
+// The twins through a draw (test_dmsh_border.py --fixture): a pixel shader as the build cuts its libraries (<key>_b without the correction, <key>_bx the alpha test, <key>_bs the twins of both),
+// drawn through pso_get and encode_args with a sampler whose border color Metal has (the plain entry point, no correction in its pipeline) and one it lacks (the twin), against the shader as it was
+// (old.metallib: the corrections in its samples) drawn the same way
+enum { DW = 8 };
+static id<MTLTexture> tw_tex(tex_t *t, uint64_t serial, int w, int h) {
+    *t = (tex_t){.magic = MAGIC('T', 'E', 'X', 0), .serial = serial};
+    t->d = (nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8, .width = w, .height = h, .depth = 1, .levels = 1, .samples = 1};
+    MTLTextureDescriptor *d = tex_desc(t, 0); d.storageMode = MTLStorageModeShared;
+    id<MTLTexture> texture = [g_dev newTextureWithDescriptor:d];
+    res_add(texture); mtl_tex_init(t); serial_put(serial, texture);
+    return texture;
+}
+static NvProg *draw_prog(id<MTLLibrary> lib, int twins) {   // twins: the reflection's border_twin
+    NvProg *pr = [NvProg new]; NvShader *vs = [NvShader new], *fs = [NvShader new]; pr->sh[0] = vs; pr->sh[1] = fs;
+    vs->stage = 0; strcpy(vs->key, "0123456789abcdef_b"); vs->fn = fn4_note([lib newFunctionWithName:@"vertex_main"], lib, @"vertex_main", nil); vs->rf.pos_attr = -1;
+    fs->stage = 1; strcpy(fs->key, "0123456789abcdef_b"); fs->fn = fn4_note([lib newFunctionWithName:@"main0"], lib, @"main0", nil); fs->has_bs = twins; fs->has_alpha = twins;
+    fs->rf.nb = 4; fs->rf.abi = 0; fs->rf.border = 4; fs->rf.color_known = 1; fs->rf.color_mask = 1;
+    fs->rf.b[0] = (nvn_rbind){.kind = NVN_RB_TEX, .reg = 0, .aid = 0, .dtt = MTLTextureType2D};
+    fs->rf.b[1] = (nvn_rbind){.kind = NVN_RB_SAMPT, .reg = 0, .aid = 1};
+    fs->rf.b[2] = (nvn_rbind){.kind = NVN_RB_SAMPT, .reg = 0, .aid = 2, .bw = 1};   // the twin of the sampler, bit 0 of the block
+    fs->rf.b[3] = (nvn_rbind){.kind = NVN_RB_BORDER, .aid = 3};
+    fs->ae = [fs->fn newArgumentEncoderWithBufferIndex:0]; fs->arg_len = fs->ae.encodedLength;
+    CHECK(fs->arg_len == 32, "the argument buffer of the entry point that never reads the twin members has all four (shader_load's own check): %lu bytes", (unsigned long)fs->arg_len);
+    return pr;
+}
+// One draw of the program over the target with the handle (texture 700, sampler id << 20); the pipeline, its key, and the target's pixels
+static id<MTLRenderPipelineState> tw_draw(NvProg *pr, tex_t *target, id<MTLTexture> rt, uint32_t handle, uint8_t px[256 * DW], pso_key *key) {
+    state_reset(); memset(&R, 0, sizeof R); mtl_sub_begin();
+    R.has_rt = 1; R.rt.n = 1; R.rt.color[0] = target; S.tex[1][0] = handle; S.chmask.mask = 0xffffffffu;
+    R.clear_c[0] = 1; R.cc[0] = MTLClearColorMake(0, 0, 0, 0);
+    CHECK(rp_begin() != nil, "the render pass opens");
+    pso_key_fill(key, pr->sh[0], pr->sh[1], g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
+    id<MTLRenderPipelineState> ps = pso_get(pr, nil);
+    CHECK(ps != nil, "the pipeline builds");
+    if (ps) {
+        enc_r_pso(g_enc, ps); enc_r_viewport(g_enc, (MTLViewport){0, 0, DW, DW, 0, 1}); args_dirty_all();
+        CHECK(encode_args((id<MTLCommandEncoder>)g_enc, pr->sh[1], 1, 0), "fragment arguments encoded");
+        enc_r_draw(g_enc, MTLPrimitiveTypeTriangle, 0, 3);
+    }
+    rp_end();
+    id<MTLBuffer> b = [g_dev newBufferWithLength:256 * DW options:MTLResourceStorageModeShared]; res_add(b);
+    enc_b_copy_texture_buffer(blit(), rt, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(DW, DW, 1), b, 0, 256, 256 * DW);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "GPU submission completed");
+    CHECK(!mtl_last_commit_error(), "GPU submission has no error");
+    memcpy(px, b.contents, 256 * DW);
+    return ps;
+}
+static int same_pixels(const uint8_t *a, const uint8_t *b) { for (int y = 0; y < DW; y++) if (memcmp(a + 256 * y, b + 256 * y, 4 * DW)) return 0; return 1; }
+static NSString *fragment_name(NvProg *pr, const pso_key *k) { return pso_desc(k, pr->sh[0], pr->sh[1], nil, 0).fragmentFunction.name; }
+static void draw_cases(const char *dir) {
+    NSString *d = @(dir); g_msl_dir = d;   // bs_fn loads <key>_bs.metallib, at_fn <key>_bx.metallib from here
+    NSString *user = [d stringByAppendingPathComponent:@"pso_user.tsv"]; setenv("DM_PSO_USER", user.fileSystemRepresentation, 1);
+    NSError *e = nil;
+    id<MTLLibrary> nl = lib_from_file([d stringByAppendingPathComponent:@"0123456789abcdef_b.metallib"], &e), ol = lib_from_file([d stringByAppendingPathComponent:@"old.metallib"], &e);
+    CHECK(nl && ol, "the fixture's libraries load: %s", e.localizedDescription.UTF8String);
+    if (!nl || !ol) return;
+    CHECK([nl newFunctionWithName:@"main0_bs"] == nil, "the base library holds no twin");
+    tex_t src, tgt; id<MTLTexture> st = tw_tex(&src, 99900, 4, 4), rt = tw_tex(&tgt, 99901, DW, DW);
+    uint8_t px[4][4][4]; for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) memcpy(px[y][x], (uint8_t[4]){(uint8_t)(40 + 50 * x), (uint8_t)(40 + 50 * y), (uint8_t)(30 * (x + y)), 255}, 4);
+    [st replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:px bytesPerRow:16];
+    mtl_reg_tex(700, &src, NULL);
+    samp_par own = {0}, lacks = {0}; own.magf = own.minf = lacks.magf = lacks.minf = 1; own.ws = own.wt = own.wr = lacks.ws = lacks.wt = lacks.wr = 5;   // linear, clamp to border
+    memcpy(lacks.border, (float[4]){0.5f, 0.25f, 0.75f, 1}, 16); memcpy(own.border, (float[4]){0, 0, 0, 1}, 16);   // opaque black is Metal's own
+    mtl_reg_samp(31, &own); mtl_reg_samp(32, &lacks);
+    os_unfair_lock_lock(&g_rmu); samp_by_id(31); samp_by_id(32); int twin31 = g_sview_w[31] != NULL, twin32 = g_sview_w[32] != NULL; os_unfair_lock_unlock(&g_rmu);   // the twin is made with the sampler
+    CHECK(!twin31 && twin32, "sampler 31 (Metal's color) has no twin, sampler 32 has one");
+    NvProg *np = draw_prog(nl, 1), *op = draw_prog(ol, 0);
+    uint8_t a[256 * DW], b[256 * DW], c[256 * DW]; pso_key kn, ko;
+    // no border color to correct: the plain entry point
+    id<MTLRenderPipelineState> plain = tw_draw(np, &tgt, rt, 700 | 31u << 20, a, &kn); tw_draw(op, &tgt, rt, 700 | 31u << 20, b, &ko);
+    CHECK(kn.bs == 0 && ko.bs == 0, "no twin is needed: key bs %u, old %u", kn.bs, ko.bs);
+    CHECK([fragment_name(np, &kn) isEqualToString:@"main0"], "the plain entry point is the fragment function: %s", fragment_name(np, &kn).UTF8String);
+    CHECK(same_pixels(a, b), "mask clear: the plain entry point draws what the shader drew");
+    // a sampler whose border color Metal lacks: the twin, and what the shader drew
+    id<MTLRenderPipelineState> twin = tw_draw(np, &tgt, rt, 700 | 32u << 20, a, &kn); tw_draw(op, &tgt, rt, 700 | 32u << 20, b, &ko);
+    CHECK(kn.bs == 1 && ko.bs == 0, "a twin is needed: key bs %u, old %u", kn.bs, ko.bs);
+    CHECK([fragment_name(np, &kn) isEqualToString:@"main0_bs"], "the twin is the fragment function: %s", fragment_name(np, &kn).UTF8String);
+    CHECK(twin && plain && twin != plain, "another pipeline for the twin");
+    CHECK(same_pixels(a, b), "mask set: the twin draws what the shader drew");
+    np->sh[1]->has_bs = 0; tw_draw(np, &tgt, rt, 700 | 32u << 20, c, &kn); np->sh[1]->has_bs = 1;   // the plain entry point with the mask set draws no correction
+    CHECK(kn.bs == 0 && !same_pixels(c, b), "the plain entry point leaves the border as Metal has it, so the twin's pixels differ from it");
+    CHECK(tw_draw(np, &tgt, rt, 700 | 31u << 20, c, &kn) == plain, "the plain pipeline is the one made before");
+    // the variants compose: the alpha test's entry point has its twin, and a draw whose key says plain takes the plain one
+    uint32_t cf[8] = {MTLPixelFormatRGBA8Unorm};
+    S.tex[1][0] = 700 | 32u << 20; S.color.alpha_func = NVN_ALPHA_FUNC_GREATER; pso_key_fill(&kn, np->sh[0], np->sh[1], cf, 0, 0, 1, 0);
+    CHECK(kn.atest == 1 && kn.bs == 1 && [fragment_name(np, &kn) isEqualToString:@"main0_a_bs"], "alpha test with a twin: %s", fragment_name(np, &kn).UTF8String);
+    S.tex[1][0] = 700 | 31u << 20; pso_key_fill(&kn, np->sh[0], np->sh[1], cf, 0, 0, 1, 0);
+    CHECK(kn.atest == 1 && kn.bs == 0 && [fragment_name(np, &kn) isEqualToString:@"main0_a"], "alpha test without: %s", fragment_name(np, &kn).UTF8String);
+    S.color.alpha_func = NVN_ALPHA_FUNC_ALWAYS;
+    // the manifest: the twin's pipeline is named by a row that parses with bs set, and the plain one's with it clear
+    NSString *rows = [NSString stringWithContentsOfFile:user encoding:NSUTF8StringEncoding error:nil]; int with = 0, without = 0;
+    for (NSString *line in [rows componentsSeparatedByString:@"\n"]) {
+        NSArray *col = [line componentsSeparatedByString:@"\t"]; pso_skey sk;
+        if (col.count == 2 && [col[0] isEqualToString:@"R"] && !pso_skey_parse([col[1] UTF8String], &sk)) { if (sk.k.bs) with++; else without++; }
+    }
+    CHECK(with == 1 && without >= 1, "pso_user.tsv has the twin's pipeline once (%d) and the plain ones (%d)", with, without);
+    printf("border twins: draws with the mask clear and set\n");
+}
+
 int main(int argc, char **argv) { @autoreleasepool {
     choice((float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 5, 0, 1, 0);   // Tears of the Kingdom's grass bend map
     choice((float[4]){0.25f, 0.5f, 0.75f, 1}, 5, 0, 1, 1);     // opaque: kept with opaque black, corrected with opaque white
@@ -86,7 +187,9 @@ int main(int argc, char **argv) { @autoreleasepool {
     choice((float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 0, 0, 0, 0);   // the border is never read
     choice((float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 5, 1, 0, 0);   // a min reduction is not linear in it
     mtl_init();
-    if (argc > 1) {   // the rewritten shader
+    struct stat sb;
+    if (argc > 1 && !stat(argv[1], &sb) && S_ISDIR(sb.st_mode)) draw_cases(argv[1]);   // the fixture of the twins' draw test
+    else if (argc > 1) {   // the rewritten shader
         id<MTLComputePipelineState> p = pipeline(argv[1]), same = argc > 2 ? pipeline(argv[2]) : nil;
         if (p && (argc < 3 || same)) {
             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:W height:H mipmapped:NO];

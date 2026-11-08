@@ -6,7 +6,8 @@
 # entry point of a library, so a base library with them made the pipeline archive twice as large, and the base library is what every shader loads. So the compile's one library is
 # cut in two: <key>_b with the plain entry points, <key>_bx with the others, which the host loads on first need (nvn_mtl.m at_fn, lo_fn). <key>_b.metal stays the plain source, which is
 # what every other tool reads. cut() takes functions out of the file as `metallib --function-name` does (byte-identical for one function), and unlike that option takes several, in groups:
-# the readable-tile version main0_f (dmsh_fetch.fold) is a third library, <key>_bf, of the same compile. The Metal cache keeps the cut libraries, not the whole one: a change to what cut()
+# the readable-tile version main0_f (dmsh_fetch.fold) is a third library, <key>_bf, of the same compile, and the border color twins of every entry point (dmsh_build.py border_twin) a fourth, <key>_bs.
+# The Metal cache keeps the cut libraries, not the whole one: a change to what cut()
 # gives for the same groups changes what the cache holds, so it needs a new dmsh_mtlcache.FORMAT.
 # Usage: unit(msl) → (the compile unit, {'alpha': entry point names, 'logic': entry point names}), or (None, {'why': why}); cut(library bytes, names of each further library's functions...)
 # → (base bytes, each further library's bytes...); shared_body(msl) → msl with main0's body as dm_body_main0 (None on an unknown shape), calling(e, name, ret, tail) → an entry point calling it

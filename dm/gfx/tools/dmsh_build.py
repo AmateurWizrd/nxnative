@@ -342,7 +342,7 @@ def gather_offsets(msl):
 # (nvn_border.h). A filtered sample is linear in the border colour, r = Σ w·texel + w_border·B, so two samples through samplers that differ only in their border colour give the rest:
 # with Metal colours Bn (the sampler) and Bw (its twin), r = s_n + (s_w - s_n)·k, k = (B - Bn) / (Bw - Bn) per channel. Each sampler member a shader samples gets a twin member
 # <member>_w and a bit in the block the shader reads (abi.KIND_BORDER: a mask word, then k per bit); the host sets the bit only for a sampler whose colour Metal lacks and whose wrap
-# mode reaches the border, so every other sample costs a uniform branch and the twin sample runs only there (border_split takes even that out of a body). Tears of the Kingdom's grass
+# mode reaches the border, so every other sample costs a uniform branch and the twin sample runs only there (border_twin takes even that out of a pixel shader's entry points, border_split out of a kernel's body). Tears of the Kingdom's grass
 # bend map (ff9def5b3c418851) samples the previous map with clamp-to-border and border 0.5 (upright): read as transparent black, every row that scrolled in flattened the grass.
 # Samples through sampler arrays, compares and gathers keep the nearest Metal colour
 BORDER_SAMPLE = '''template<typename V, typename T, typename... A> static inline __attribute__((always_inline)) V dm_bs(V r, constant dm_border_t* b, uint i, T t, sampler w, A... a)
@@ -439,9 +439,10 @@ def frag_z_snap(msl):
     msl = msl[:first] + body + msl[end - 1:]
     return msl.replace('using namespace metal;\n', 'using namespace metal;\n\n' + ZSNAP, 1), n
 
-# One branch on the block's mask instead of one per sample: with the bits clear (the draw's samplers have no border colour to correct, nearly every draw) a shader's samples gain nothing
-# from their uniform `if` but a split of the shader into 12-17 blocks, which stops the compiler batching the samples and interleaving the arithmetic between them (Ocarina of Time, M3 Pro,
-# 1536x864: 59 heavy pixel shaders without the mix, GPU p50 18.59 to 17.72 ms). border_split gives the body twice, once with the correction and once without it
+# One branch on the block's mask instead of one per sample, for a compute kernel: with the bits clear (the draw's samplers have no border colour to correct, nearly every draw) a shader's samples
+# gain nothing from their uniform `if` but a split of the shader into 12-17 blocks, which stops the compiler batching the samples and interleaving the arithmetic between them (Ocarina of Time,
+# M3 Pro, 1536x864: 59 heavy pixel shaders without the mix, GPU p50 18.59 to 17.72 ms). border_split gives a kernel's body twice, once with the correction and once without it;
+# a pixel shader gets border_twin instead, which keeps the two out of one function (a split body shared its function's register allocation, and gained nothing)
 BORDER_SPLIT_SAMPLE = '''template<bool S, typename V, typename T, typename... A> static inline __attribute__((always_inline)) V dm_bs(V r, constant dm_border_t* b, uint i, T t, sampler w, A... a)
 {
     if (S && (b->mask >> i & 1u)) r = dm_bmix(r, t.sample(w, a...), b->k[i]);
@@ -449,25 +450,50 @@ BORDER_SPLIT_SAMPLE = '''template<bool S, typename V, typename T, typename... A>
 }
 '''
 def border_split(msl):
-    """The body of a pixel shader's compile source (the file's text, dmsh_side.unit's or dmsh_fetch.fold's: dm_body_main0) or of a compute kernel (main0), with its corrected samples split
-    on the block's mask: the body becomes the template dm_body_main0_bs<DM_BS>, whose dm_bs takes the flag (BORDER_SPLIT_SAMPLE: false, it returns its first sample, so that instantiation is
-    the shader without the correction), and the function the callers know runs the true one only when the mask has a bit set, and the false one otherwise. A pixel shader's dm_body_main0
-    keeps its parameters, so every caller of it (main0, main0_u, main0_f, the alpha test and logic entry points) is as it was; a kernel's main0 keeps its own, and calls the body with them
-    stripped of their attributes. The result is the same for any mask. msl unchanged when it has no such body, a dm_bs call outside it (a helper function would need the flag too) or, in a
-    kernel, a threadgroup variable (its declarations stay in the entry point); a shader without the correction costs what it did"""
-    m = dmsh_side._BODY.search(msl) or re.search(r'^kernel void main0\(', msl, re.M)
+    """The body of a compute kernel (main0), with its corrected samples split on the block's mask: the body becomes the template dm_body_main0_bs<DM_BS>, whose dm_bs takes the flag
+    (BORDER_SPLIT_SAMPLE: false, it returns its first sample, so that instantiation is the kernel without the correction), and main0 runs the true one only when the mask has a bit set, and
+    the false one otherwise, calling the body with its own parameters stripped of their attributes. The result is the same for any mask. msl unchanged when it has no such kernel, a dm_bs
+    call outside it (a helper function would need the flag too) or a threadgroup variable (its declarations stay in the entry point); a kernel without the correction costs what it did"""
+    m = re.search(r'^kernel void main0\(', msl, re.M)
     if not m or BORDER_SAMPLE not in msl: return msl
-    kernel = m.group().startswith('kernel'); start = m.start(); head = dmsh_side._close(msl, m.end(), '(', ')')
+    start = m.start(); head = dmsh_side._close(msl, m.end(), '(', ')')
     end = dmsh_side._close(msl, msl.find('{', head) + 1, '{', '}') if head >= 0 else -1
-    if end < 0 or 'dm_bs(' not in msl[head:end] or re.search(r'\bdm_bs\(', msl[:start].replace(BORDER_SAMPLE, '') + msl[end:]) or (kernel and re.search(r'\bthreadgroup\b', msl[head:end])): return msl
+    if end < 0 or 'dm_bs(' not in msl[head:end] or re.search(r'\bdm_bs\(', msl[:start].replace(BORDER_SAMPLE, '') + msl[end:]) or re.search(r'\bthreadgroup\b', msl[head:end]): return msl
     decl = [re.sub(r'\s*\[\[.*\]\]$', '', p) for p in dmsh_side._params(msl[m.end():head - 1])]; names = [re.search(r'(\w+)$', d) for d in decl]
     if not all(names) or 'spvDescriptorSet0' not in {n.group(1) for n in names}: return msl
     decl, args = ', '.join(decl), ', '.join(n.group(1) for n in names)
     mask = f'spvDescriptorSet0.{abi.BORDER_MEMBER}->mask != 0u'
-    entry = (msl[start:head] + f'\n{{\n    if ({mask}) dm_body_main0_bs<true>({args});\n    else dm_body_main0_bs<false>({args});\n}}\n' if kernel else
-             dmsh_side.BODY + decl + f')\n{{\n    return {mask} ? dm_body_main0_bs<true>({args}) : dm_body_main0_bs<false>({args});\n}}\n')
-    split = f'template<bool DM_BS> static inline __attribute__((always_inline)) {"void" if kernel else "main0_out"} dm_body_main0_bs({decl})' + re.sub(r'\bdm_bs\(', 'dm_bs<DM_BS>(', msl[head:end]) + '\n' + entry
+    entry = msl[start:head] + f'\n{{\n    if ({mask}) dm_body_main0_bs<true>({args});\n    else dm_body_main0_bs<false>({args});\n}}\n'
+    split = f'template<bool DM_BS> static inline __attribute__((always_inline)) void dm_body_main0_bs({decl})' + re.sub(r'\bdm_bs\(', 'dm_bs<DM_BS>(', msl[head:end]) + '\n' + entry
     return (msl[:start] + split + msl[end:]).replace(BORDER_SAMPLE, BORDER_SPLIT_SAMPLE, 1)
+_BS_BODY = re.compile(r'^static (?:__attribute__\(\(always_inline\)\) )?\w+ (dm_body_\w+)\(', re.M)
+_BS_CALL = re.compile(r'(?<!V )\bdm_bs\(')   # a wrapped sample (border_emu); the helper's definition is `V dm_bs(`
+def border_twin(msl):
+    """A pixel shader's compile unit (dmsh_side.unit's or dmsh_fetch.fold's: entry points calling the body dm_body_main0) as the same entry points without the border color correction,
+    and after them each entry point again as its twin <entry>_bs (abi.BORDER_FN) with the correction as border_emu wrote it. The plain copy of each function of the unit that is an entry point
+    or a dm_body_* (what they run) has its dm_bs(sample, ...) calls reduced to the sample, which is what they give with the block's mask clear; its twin is the function as it was, under
+    the names with the suffix. A draw whose samplers need no correction (nearly every draw) takes a plain entry point, a pipeline with no correction in it, and any other the twin
+    (nvn_mtl.m bs_fn). The prelude, the helpers and the function constants stay one copy, which is why the twins go last. → (the text, the names of the twin entry points); (msl, ())
+    when no such function holds a dm_bs call, or one lies outside them (a helper function: its samples would be corrected in neither copy), or a function does not close"""
+    spans = []   # (start, end, name, entry point) of the functions to copy
+    for pat, entry in ((dmsh_side._ENTRY, True), (_BS_BODY, False)):
+        for m in pat.finditer(msl):
+            head = dmsh_side._close(msl, m.end(), '(', ')'); end = dmsh_side._close(msl, msl.find('{', head) + 1, '{', '}') if head >= 0 else -1
+            if end < 0: return msl, ()
+            spans.append((m.start(), end, m.group(3 if entry else 1), entry))
+    spans.sort()
+    gaps = ''.join(msl[a:b] for a, b in zip([0] + [s[1] for s in spans], [s[0] for s in spans] + [len(msl)]))
+    if not any(_BS_CALL.search(msl, s[0], s[1]) for s in spans) or _BS_CALL.search(gaps): return msl, ()
+    rename = re.compile(r'\b(?:%s)\b' % '|'.join(sorted({s[2] for s in spans}, key=len, reverse=True)))
+    plain = msl
+    for start, end, _, _ in reversed(spans):   # the last first: a span's calls are rewritten after the ones that come later, whose length changes nothing before them
+        part = plain[start:end]
+        for m in reversed(list(_BS_CALL.finditer(part))):   # an inner call (a sample inside another's arguments) before the outer one that holds it
+            first = part.index('(', m.end()); keep = dmsh_side._close(part, first + 1, '(', ')')   # the sample, which is the call's first argument
+            part = part[:m.start()] + part[m.end():keep] + part[dmsh_side._close(part, m.end(), '(', ')'):]
+        plain = plain[:start] + part + plain[end:]
+    twins = ''.join(rename.sub(lambda m: m.group() + abi.BORDER_FN, msl[s[0]:s[1]]) + '\n' for s in spans)
+    return plain + '\n' + twins, tuple(s[2] + abi.BORDER_FN for s in spans if s[3])
 STORE = shader_cache.Store(os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas.db')))
 atexit.register(STORE.close)   # folds its log into the one file
 CAS_LOCKS, CAS_LOCKS_GUARD = {}, threading.Lock()
@@ -742,8 +768,9 @@ def ps_libraries(key, msl, full, bindings):
     operation ones (dmsh_side.unit), <key>_bf with its readable-tile version main0_f (dmsh_fetch.fold; a shader without a rewritable sample only when bf_want.tsv lists it). The readable-tile
     version was a source and a Metal compile of its own (13,666 of Mario Kart 8 Deluxe's 29,651 shaders). msl: the file of its plain source, full; bindings: its reflection's.
     What does not build is left out, and only that: a unit whose readable-tile version does not build is compiled again without it, one that does not build at all gives <key>_b from the
-    plain source, each with a red line. A library a shader does not get is removed (a stale one of an earlier build), and the host draws without it. A unit is compiled with its body's border
-    colour correction split on the block's mask (border_split), and as it is when that does not build, with a red line. → what the reflection says of them.
+    plain source, each with a red line. A library a shader does not get is removed (a stale one of an earlier build), and the host draws without it. A unit with the border color correction in
+    its samples is compiled with its entry points without it and their twins with it (border_twin), the twins cut into <key>_bs, and as it is when that does not build, with a red line:
+    the reflection's border_twin then is absent, and the host draws with the entry points that correct. → what the reflection says of them.
     Raises CalledProcessError when the plain source does not compile"""
     targets = [(t, d) for t, d in (('mac', out), ('ios', IOSOUT)) if d and t in TARGETS]
     def drop(*suffixes):
@@ -755,19 +782,21 @@ def ps_libraries(key, msl, full, bindings):
     side = set(info['alpha'] + info['logic']) if src else set()
     folded, fmeta = dmsh_fetch.fold(src or full, bindings, om_only_ok=key in BF_WANT)   # also without side entry points: main0_f then shares the compile with main0 alone
     for unit, fetch in ([(folded, fmeta)] if folded else []) + ([(src, None)] if src else []):
-        names = ['_b'] + (['_bx'] if side else []) + (['_bf'] if fetch else [])
+        base = ['_b'] + (['_bx'] if side else []) + (['_bf'] if fetch else [])
         groups = ([side] if side else []) + ([{'main0_f'}] if fetch else [])
         u = os.path.join(w, key + '_bu.metal')
-        def build(text):
+        def build(text, twins=()):   # → the libraries of the compile: the twins' names are the ones of text's entry points with the suffix
+            names, gs = base + (['_bs'] if twins else []), groups + ([set(twins)] if twins else [])
             open(u, 'w').write(text)
-            for t, d in targets: MTL.compile_split(t, u, [os.path.join(d, key + n + '.metallib') for n in names], lambda lib, groups=groups: dmsh_side.cut(lib, *groups))
+            for t, d in targets: MTL.compile_split(t, u, [os.path.join(d, key + n + '.metallib') for n in names], lambda lib: dmsh_side.cut(lib, *gs))
+            return names
         try:
-            split = border_split(unit)   # the samples' border colour correction split on the block's mask (see border_split); the unit as it is when that does not build
-            try: build(split)
+            text, twins = border_twin(unit)   # the entry points without the border color correction, and their twins with it (see border_twin); the unit as it is when that does not build
+            try: names = build(text, twins)
             except (subprocess.CalledProcessError, ValueError) as e:
-                if split == unit: raise
-                build(unit); SIDE_STATS['split fallback'] += 1   # the RED line only once the unit builds without it: when it does not, the split was not the cause
-                print(f'[RED] {key}: the border colour split does not build ({str(e)[:120]}): compiled without it', flush=True)
+                if not twins: raise
+                names = build(unit); twins = (); SIDE_STATS['split fallback'] += 1   # the RED line only once the unit builds without them: when it does not, they were not the cause
+                print(f'[RED] {key}: the border color twin entry points do not build ({str(e)[:120]}): compiled without them, the correction stays in the entry points', flush=True)
         except (subprocess.CalledProcessError, ValueError) as e:
             if fetch: BF_STATS['failed'] += 1; print(f'[RED] {key}: the readable-tile version does not build ({str(e)[:120]}): its draws go without the tile read', flush=True)
             else: SIDE_STATS['failed'] += 1; print(f'[RED] {key}: the alpha test and logic operation entry points do not build ({str(e)[:120]}): its draws go without them', flush=True)
@@ -775,11 +804,11 @@ def ps_libraries(key, msl, full, bindings):
         finally:
             try: os.unlink(u)
             except FileNotFoundError: pass
-        drop(*{'_bx', '_bf'} - set(names))
-        SIDE_STATS['generated'] += bool(side); BF_STATS['generated'] += bool(fetch)
-        return {**{f: {'entries': info[f]} for f in ('alpha', 'logic') if side and info[f]}, **({'fetch': fetch} if fetch else {})}
+        drop(*{'_bx', '_bf', '_bs'} - set(names))
+        SIDE_STATS['generated'] += bool(side); BF_STATS['generated'] += bool(fetch); SIDE_STATS['twins'] += bool(twins)
+        return {**{f: {'entries': info[f]} for f in ('alpha', 'logic') if side and info[f]}, **({'fetch': fetch} if fetch else {}), **({'border_twin': abi.BORDER_FN} if twins else {})}
     SIDE_STATS['not generated'] += not src
-    drop('_bx', '_bf')
+    drop('_bx', '_bf', '_bs')
     for t, d in targets: MTL.compile(t, msl, os.path.join(d, key + '_b.metallib'))
     return {}
 
@@ -1964,7 +1993,8 @@ print(f'readable-tile versions (<key>_bf, dmsh_fetch.py): {BF_STATS["generated"]
 print(f'shadow-input libraries (<key>_bv, dmsh_vin.py): {VIN_STATS["generated"]} generated, {VIN_STATS["failed"]} failed to compile, {VIN_STATS["not generated"]} not generated; '
       f'{VIN_STATS["inputs"]} integer inputs shadowed, {VIN_STATS["float only"]} of them with no other-sign shadow (attribute indices ran out)')
 print(f'alpha test and logic operation libraries (<key>_bx, dmsh_side.py): {SIDE_STATS["generated"]} generated, {SIDE_STATS["failed"]} failed to compile, {SIDE_STATS["not generated"]} pixel shaders without either')
-print(f'compiled without their split or cache for want of a build: {SIDE_STATS["split fallback"]} border colour splits (border_split), {SIDE_STATS["raw cache fallback"]} mesh raw load caches (dmsh_meshstage.py _raw_cache)')
+print(f'border color twin libraries (<key>_bs, border_twin): {SIDE_STATS["twins"]} generated')
+print(f'compiled without their twin entry points, split or cache for want of a build: {SIDE_STATS["split fallback"]} border color twins (border_twin) or kernel splits (border_split), {SIDE_STATS["raw cache fallback"]} mesh raw load caches (dmsh_meshstage.py _raw_cache)')
 print(f'pulling libraries (<key>_bp, dmsh_pull.py): {PULL_STATS["generated"]} generated, {PULL_STATS["failed"]} failed to compile, {PULL_STATS["not generated"]} not generated, '
       f'{PULL_STATS["no stage input"]} vertex shaders without stage inputs (none needed)')
 print('mesh libraries (<vertex>_<geometry>_m3, dmsh_mesh.py): ' + (', '.join(f'{k} {v}' for k, v in MESH_STATS.items()) or 'none'))
