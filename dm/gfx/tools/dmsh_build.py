@@ -302,6 +302,9 @@ def tg_spill(msl):
 # the compiler takes it anyway: the gathers then read texels at offsets that differ between lanes and between runs, with no error. agl's NDSR upscaler builds its input tile this way, so
 # some of its lanes saw zeros and the network drew dotted rows in smooth areas of the picture (the same frame, three pictures). Each call becomes its four gathers, offsets written out
 GATHER4 = 'template<typename T> static inline __attribute__((always_inline)) vec<T, 4> dm_gather4(T a, T b, T c, T d) { return vec<T, 4>(a, b, c, d); }\n'
+# Offsets (0,0) (1,0) (0,1) (1,1) read the four texels of the one 2x2 footprint, so a call with them is one gather with its components in that order (agl's NDSR input tile: 4 gathers a site, 16 a lane, in its first
+# step): the gather at offset 0 holds them as w, z, x, y. Each texel is addressed on its own (clamp, wrap, border), so the values are the same bits
+GATHER_QUAD = {(0, 0): 'w', (1, 0): 'z', (0, 1): 'x', (1, 1): 'y'}
 def gather_offsets(msl):
     if not re.search(r'\bspvGather(Compare)?ConstOffsets\(spvDesc|= spvGather(Compare)?ConstOffsets\(', msl): return msl
     arrays = {}
@@ -323,10 +326,16 @@ def gather_offsets(msl):
         tex, smp, off, rest = args[0], args[1], arrays[args[2]], ', '.join(args[base:])
         tail = '' if cmp else ', ' + args[3]
         fn = 'gather_compare' if cmp else 'gather'
-        out += [msl[i:m.start()], 'dm_gather4(' + ', '.join(f'{tex}.{fn}({smp}, {rest}, {o}{tail}).w' for o in off) + ')']
+        # offsets that are the four texels of one gather's footprint: one gather gives all of them (a gather's w is the texel at its offset, z the one to its right, x below, y below right)
+        quad = None if cmp else [GATHER_QUAD.get((lambda v: (v[0], v[-1]))(tuple(int(x) for x in re.findall(r'\d+', o[4:])))) for o in off]   # int2(1) is (1, 1)
+        if quad and None not in quad and len(set(quad)) == 4:
+            out += [msl[i:m.start()], f'{tex}.gather({smp}, {rest}, int2(0){tail}).' + ''.join(quad)]
+        else:
+            out += [msl[i:m.start()], 'dm_gather4(' + ', '.join(f'{tex}.{fn}({smp}, {rest}, {o}{tail}).w' for o in off) + ')']
         i = j
     out.append(msl[i:])
     msl = ''.join(out)
+    if 'dm_gather4(' not in msl: return msl
     k = msl.index('\n', msl.index('using namespace metal;')) + 1
     return msl[:k] + GATHER4 + msl[k:]
 # Border colours: Maxwell's sampler takes any RGBA border colour, Metal's only transparent black, opaque black or opaque white, and the host's sampler gets the nearest of them
@@ -1645,6 +1654,7 @@ def finish(key, w, j, c1):
             src = open(msl).read()
     try: src = dmsh_atomic.check_msl(src)
     except ValueError as e: return 'image atomic MSL failed', str(e), None
+    src = dmsh_atomic.float_adds(src)   # float add loops as native atomic_float adds (see dmsh_atomic.float_adds)
     src = precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
     src = mul_extended(src)   # scalar extended products without the optnone wrapper (see mul_extended)
     try: src = gather_offsets(src)   # four gathers instead of a wrapper's loop over their offsets (see gather_offsets)

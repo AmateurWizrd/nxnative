@@ -59,3 +59,42 @@ def check_msl(source):
     if 'tomic' in source and _EMULATED.search(source):   # (both alternatives hold the word; the pattern alone tries every character of the source)
         raise ValueError('image atomics emulated through a raw pointer; they must be native texture atomics (MSL 3.1)')
     return source
+
+
+# SPIRV-Cross's form of the translator's float add (InstEmitMemory.cs EmitAtomicAddF32): a compare-and-swap loop on the word, the outer loop retrying until the word was the one read. Several
+# lanes (and every SIMD-group of the dispatch) on one word retry each other; Ocarina of Time's scene analysis (AglShader's probe and shadow sums) adds to a few words from every lane or SIMD-group.
+_FADD = re.compile(
+    r'(?P<i>[ \t]*)do\n(?P=i)\{\n'
+    r'(?P<pre1>(?:(?P=i)    [^{}\n]*;\n)*?)'   # the address, worked out in the loop (an indexed word); the load and the compare-and-swap each work it out
+    r'(?P=i)    float (?P<old>_\d+) = as_type<float>\((?P<load>[^\n]+)\);\n'
+    r'(?P=i)    float (?P<sum>_\d+) = (?P=old) \+ (?P<val>[^;\n]+);\n'
+    r'(?P<pre2>(?:(?P=i)    [^{}\n]*;\n)*?)'
+    r'(?P=i)    uint (?P<exp>_\d+) = as_type<uint>\((?P=old)\);\n'
+    r'(?P=i)    uint (?P<cur>_\d+);\n'
+    r'(?P=i)    do\n(?P=i)    \{\n(?P=i)        (?P=cur) = (?P=exp);\n'
+    r'(?P=i)    \} while \(!atomic_compare_exchange_weak_explicit\(\(device atomic_uint\*\)&(?P<addr>[^\n]+), &(?P=cur), as_type<uint>\((?P=sum)\), memory_order_relaxed, memory_order_relaxed\) && (?P=cur) == (?P=exp)\);\n'
+    r'(?P=i)    (?P<fdecl>uint )?(?P<found>_\d+) = (?P=cur);\n'
+    r'(?P=i)    (?P<flag>_\d+) = int\((?P=found)\) != as_type<int>\((?P=old)\);\n'
+    r'(?P=i)\} while \((?P=flag)\);\n')
+
+
+def float_adds(source):
+    """Each float add loop as one native atomic_float add (Metal 3, Apple GPUs).
+
+    The loop costs a read, a compare-and-swap and a retry for every add that lost the word to another; Metal adds a float in one instruction. The order of the additions was never fixed (the
+    atomics of different threads and SIMD-groups run in any order), so the sums differ in rounding only, as two runs of the loop differ.
+    Not a SIMD-group sum and one add per group, which the lanes' same-word adds look made for: on this GPU the native add of every lane to one word takes as long (the hardware merges them).
+    A loop of another shape, or one whose names are read elsewhere, stays what it was.
+    """
+    if 'atomic_compare_exchange_weak_explicit' not in source:
+        return source
+
+    def one(m):
+        i = m['i']
+        used = lambda n: len(re.findall(r'\b%s\b' % n, source)) > len(re.findall(r'\b%s\b' % n, m[0]))   # also outside the loop
+        if any(used(m[n]) for n in ('old', 'sum', 'exp', 'cur')): return m[0]   # a name the rewrite removes is read elsewhere
+        pre = re.sub('(?m)^' + i + '    ', i, m['pre1'] + m['pre2'])   # kept, outside the loop now: statements of single values
+        if re.search(r'\b(%s)\b' % '|'.join(m[n] for n in ('old', 'sum', 'exp', 'cur', 'found', 'flag')), pre): return m[0]
+        found = f"{i}{m['fdecl'] or ''}{m['found']} = as_type<uint>({m['old']});\n" if m['fdecl'] is None or used(m['found']) else ''   # the loop's result, if read (or declared before the loop: it may be)
+        return pre + f"{i}float {m['old']} = atomic_fetch_add_explicit((device atomic_float*)&{m['addr']}, {m['val']}, memory_order_relaxed);\n" + found
+    return _FADD.sub(one, source)

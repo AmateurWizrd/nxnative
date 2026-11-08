@@ -1,4 +1,4 @@
-"""textureGatherOffsets (dmsh_build.py gather_offsets): each call of spirv-cross's spvGatherConstOffsets / spvGatherCompareConstOffsets becomes its four gathers with their offsets written out,
+"""textureGatherOffsets (dmsh_build.py gather_offsets): each call of spirv-cross's spvGatherConstOffsets / spvGatherCompareConstOffsets becomes its four gathers with their offsets written out (one gather for the offsets of a 2x2 footprint),
 in plain and array forms, and on this Mac's GPU a compute shader's rewritten gathers match texel reads in every lane, on two runs."""
 import ast
 from pathlib import Path
@@ -11,7 +11,7 @@ import unittest
 TOOLS = Path(__file__).resolve().parents[1] / 'tools'
 tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
 selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name == 'gather_offsets')
-            or (isinstance(n, ast.Assign) and any(getattr(t, 'id', None) in ('GATHER4', 'MAC_METAL') for t in n.targets))]
+            or (isinstance(n, ast.Assign) and any(getattr(t, 'id', None) in ('GATHER4', 'GATHER_QUAD', 'MAC_METAL') for t in n.targets))]
 scope = {'re': re}
 exec(compile(ast.Module(body=selected, type_ignores=[]), str(TOOLS / 'dmsh_build.py'), 'exec'), scope)
 gather_offsets, MAC_METAL = scope['gather_offsets'], scope['MAC_METAL']
@@ -78,15 +78,19 @@ class Rewrite(unittest.TestCase):
         src = HEAD + '\nkernel void k() {}\n'
         self.assertEqual(gather_offsets(src), src)
 
-    def test_call_becomes_four_gathers(self):
+    def test_footprint_offsets_become_one_gather(self):
         out = gather_offsets(HEAD + 'float4 f(texture2d<float> t, sampler s, float2 c) { float4 a = spvGatherConstOffsets(t, s, _9, component::z, select(c, float2(0.0), isnan(c))); return a; }\n')
         self.assertNotIn('= spvGatherConstOffsets(', out)
-        self.assertIn('dm_gather4(t.gather(s, select(c, float2(0.0), isnan(c)), int2(0), component::z).w, t.gather(s, select(c, float2(0.0), isnan(c)), int2(1, 0), component::z).w, '
-                      't.gather(s, select(c, float2(0.0), isnan(c)), int2(0, 1), component::z).w, t.gather(s, select(c, float2(0.0), isnan(c)), int2(1), component::z).w)', out)
+        self.assertIn('float4 a = t.gather(s, select(c, float2(0.0), isnan(c)), int2(0), component::z).wzxy;', out)
+        self.assertNotIn('dm_gather4', out)
+
+    def test_other_offsets_stay_four_gathers(self):
+        out = gather_offsets(HEAD.replace('int2(1, 0), int2(0, 1), int2(1)', 'int2(2, 0), int2(0, 1), int2(1)') + 'float4 f(texture2d<float> t, sampler s, float2 c) { float4 a = spvGatherConstOffsets(t, s, _9, component::z, c); return a; }\n')
+        self.assertIn('dm_gather4(t.gather(s, c, int2(0), component::z).w, t.gather(s, c, int2(2, 0), component::z).w, t.gather(s, c, int2(0, 1), component::z).w, t.gather(s, c, int2(1), component::z).w)', out)
 
     def test_array_and_compare(self):
         out = gather_offsets(HEAD + 'float4 f(texture2d_array<float> t, depth2d<float> z, sampler s, float2 c) { float4 a = spvGatherConstOffsets(t, s, _9, component::x, c, uint(rint(1.0))); float4 b = spvGatherCompareConstOffsets(z, s, _9, c, 0.5); return a + b; }\n')
-        self.assertIn('t.gather(s, c, uint(rint(1.0)), int2(1, 0), component::x).w', out)
+        self.assertIn('t.gather(s, c, uint(rint(1.0)), int2(0), component::x).wzxy', out)
         self.assertIn('z.gather_compare(s, c, 0.5, int2(0, 1)).w', out)
 
     def test_offsets_not_constant_refused(self):
