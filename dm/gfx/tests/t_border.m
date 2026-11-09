@@ -160,6 +160,16 @@ static void draw_cases(const char *dir) {
     np->sh[1]->has_bs = 0; tw_draw(np, &tgt, rt, 700 | 32u << 20, c, &kn); np->sh[1]->has_bs = 1;   // the plain entry point with the mask set draws no correction
     CHECK(kn.bs == 0 && !same_pixels(c, b), "the plain entry point leaves the border as Metal has it, so the twin's pixels differ from it");
     CHECK(tw_draw(np, &tgt, rt, 700 | 31u << 20, c, &kn) == plain, "the plain pipeline is the one made before");
+    // through draw: a texture bind between two draws of one program in one pass changes no pipeline state, and the second draw still takes the twin
+    static prog_t pg = {.serial = 99902}; serial_put(pg.serial, np);   // NOLINT(clang-analyzer-osx.cocoa.RetainCount): g_by_serial owns np (serial_put's CFBridgingRetain)
+    state_reset(); memset(&R, 0, sizeof R); mtl_sub_begin(); S.prog = &pg;
+    R.has_rt = 1; R.rt.n = 1; R.rt.color[0] = &tgt; S.chmask.mask = 0xffffffffu; R.clear_c[0] = 1; R.cc[0] = MTLClearColorMake(0, 0, 0, 0);
+    p_draw dw = {.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .count = 3}; p_bind_handles bt = {.stage = 1, .n = 1, .h = {700 | 31u << 20}};
+    state_op(OP_BIND_TEX, &bt); draw(&dw, NULL);
+    CHECK(g_enc_pso == plain, "draw: the first draw takes the plain pipeline");
+    bt.h[0] = 700 | 32u << 20; state_op(OP_BIND_TEX, &bt); draw(&dw, NULL);
+    CHECK(g_enc_pso == twin, "draw: after the bind, the second draw takes the twin's pipeline");
+    rp_end(); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "GPU submission completed");
     // the variants compose: the alpha test's entry point has its twin, and a draw whose key says plain takes the plain one
     uint32_t cf[8] = {MTLPixelFormatRGBA8Unorm};
     S.tex[1][0] = 700 | 32u << 20; S.color.alpha_func = NVN_ALPHA_FUNC_GREATER; pso_key_fill(&kn, np->sh[0], np->sh[1], cf, 0, 0, 1, 0);
@@ -174,6 +184,10 @@ static void draw_cases(const char *dir) {
         if (col.count == 2 && [col[0] isEqualToString:@"R"] && !pso_skey_parse([col[1] UTF8String], &sk)) { if (sk.k.bs) with++; else without++; }
     }
     CHECK(with == 1 && without >= 1, "pso_user.tsv has the twin's pipeline once (%d) and the plain ones (%d)", with, without);
+    // a twin library that is not there: the draw that needs it goes with the plain entry point (one red line), and the pipeline still builds (old.metallib's main0: twins are cached by function)
+    NvProg *mp = draw_prog(ol, 1); strcpy(mp->sh[1]->key, "fedcba9876543210_b");
+    id<MTLRenderPipelineState> miss = tw_draw(mp, &tgt, rt, 700 | 32u << 20, c, &kn);
+    CHECK(kn.bs == 1 && miss && [fragment_name(mp, &kn) isEqualToString:@"main0"], "no twin library: the plain entry point draws: %s", fragment_name(mp, &kn).UTF8String);
     printf("border twins: draws with the mask clear and set\n");
 }
 

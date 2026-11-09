@@ -47,12 +47,14 @@ int main(void) { @autoreleasepool {
     NSString *kc = @"#include <metal_stdlib>\nusing namespace metal;\nconstant uint m [[function_constant(0)]];\n"
         "kernel void main0(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = is_function_constant_defined(m) ? m : i; }\n";
     [NSFileManager.defaultManager createDirectoryAtPath:msl withIntermediateDirectories:YES attributes:nil error:nil];
-    if (lib(msl, @"v1_bp", v) || lib(msl, @"f1_b", [NSString stringWithFormat:f, 1, 0]) || lib(msl, @"f2_b", [NSString stringWithFormat:f, 0, 1]) || lib(msl, @"fc_b", fc) ||
+    if (lib(msl, @"v1_bp", v) || lib(msl, @"f1_b", [NSString stringWithFormat:f, 1, 0]) || lib(msl, @"f1_bs", @"#include <metal_stdlib>\nusing namespace metal;\nfragment float4 main0_bs() { return float4(1, 1, 0, 1); }\n") ||
+        lib(msl, @"f2_b", [NSString stringWithFormat:f, 0, 1]) || lib(msl, @"fc_b", fc) ||
         lib(msl, @"c1_b", [NSString stringWithFormat:k, 2]) || lib(msl, @"c2_b", [NSString stringWithFormat:k, 4]) ||
         lib(msl, @"c3_b", [NSString stringWithFormat:k, 5]) || lib(msl, @"cc_b", kc)) {
         printf("t_pso_bundle: no Metal compiler (xcrun metal), GPU checks not run; %d file checks failed\n", failed); return failed != 0; }
     put([msl stringByAppendingPathComponent:@"v1_b.json"], [NSString stringWithFormat:@"{\"chain\": \"%s\", \"entry\": \"main0\", \"entry_z\": \"main0_z\", \"pull\": {}, \"vertex_inputs\": []}", DMSH_CHAIN]);
-    for (NSString *k in @[@"f1", @"f2", @"fc"]) put([msl stringByAppendingFormat:@"/%@_b.json", k], [NSString stringWithFormat:@"{\"chain\": \"%s\", \"entry\": \"main0\"}", DMSH_CHAIN]);
+    for (NSString *k in @[@"f1", @"f2", @"fc"]) put([msl stringByAppendingFormat:@"/%@_b.json", k], [NSString stringWithFormat:@"{\"chain\": \"%s\", \"entry\": \"main0\"%@}", DMSH_CHAIN,
+                                              [k isEqualToString:@"f1"] ? @", \"border_twin\": \"" DMSH_BORDER_FN "\"" : @""]);   // f1 has border color twins (<key>_bs): a second base
     for (NSString *c in @[@"c1", @"c2", @"c3", @"cc"]) put([msl stringByAppendingFormat:@"/%@_b.json", c], [NSString stringWithFormat:@"{\"chain\": \"%s\", \"route\": \"B\", \"bindings\": [], \"stage\": \"cs\", \"entry\": \"main0\"%@}",
                                                 DMSH_CHAIN, @""]);
     put([tables stringByAppendingPathComponent:@"shader_map.tsv"], @"package\tindex\tstage\tdm_ctl_sha16\tsource\ncs.bin\t0\tcompute\tc1\tx\ncs.bin\t1\tcompute\tc2\tx\ncs.bin\t2\tcompute\tcc\tx\n");
@@ -107,6 +109,11 @@ int main(void) { @autoreleasepool {
     shmap_load(); pso4_init();
     EXPECT("bundle: opened", 1, g_arch_bundle != nil);
     EXPECT("bundle: first among the files without a vertex layout", 1, g_arch4p.count && g_arch4p[0] == g_arch_bundle);
+    @autoreleasepool {   // the twin base pso_offline.py made is the one the host asks for (pre_twin, as pso_desc_pull makes it for a draw with pso_key.bs)
+        MTL4RenderPipelineDescriptor *m = pre_desc(@"v1", @"f1", 0), *t = m ? pre_twin(m, @"f1") : nil;
+        EXPECT("bundle: the twin base", 1, t && [g_arch_bundle newRenderPipelineStateWithDescriptor:t error:nil] != nil);
+        EXPECT("bundle: no twin base for a shader without twins", 1, pre_twin(pre_desc(@"v1", @"f2", 0), @"f2") == nil);
+    }
     // compute pipelines: the shader map's compute shaders come from the bundle; a shader with function constants and one the map does not have are built
     @autoreleasepool {
         NvShader *c1 = shader_load(@"c1_b", 5, 0), *c2 = shader_load(@"c2_b", 5, 0), *c3 = shader_load(@"c3_b", 5, 0), *cc = shader_load(@"cc_b", 5, 0); NSError *err = nil;
@@ -161,14 +168,14 @@ int main(void) { @autoreleasepool {
     [NSFileManager.defaultManager removeItemAtPath:[arch stringByAppendingPathComponent:@"prebuilt.tsv"] error:nil];
     reset_counts(); atomic_store(&g_depth_zero, 1);
     EXPECT("other depth mode: every pair", 3, pso_prebuild(1, 1, QOS_CLASS_USER_INITIATED));
-    EXPECT("other depth mode: every base compiled", 3, g_pre_built);
+    EXPECT("other depth mode: every base compiled (f1's twin too)", 4, g_pre_built);
     atomic_store(&g_depth_zero, 0);
     // other pairs (a second list): the device's prebuild runs and takes the bundled bases it finds
     [NSFileManager.defaultManager removeItemAtPath:[arch stringByAppendingPathComponent:@"prebuilt.tsv"] error:nil];
     put([tables stringByAppendingPathComponent:@"more.tsv"], @"v1\tf2\nv1\tfc\n"); setenv("DM_PSO_PAIRS", [tables stringByAppendingPathComponent:@"more.tsv"].UTF8String, 1);
     reset_counts();
     EXPECT("other pairs: every pair", 3, pso_prebuild(1, 1, QOS_CLASS_USER_INITIATED));
-    EXPECT("other pairs: two bases from the bundle", 2, g_pre_archived);
+    EXPECT("other pairs: three bases from the bundle (f1's twin too)", 3, g_pre_archived);
     EXPECT("other pairs: one compiled", 1, g_pre_built);
     unsetenv("DM_PSO_PAIRS");
     // a matching stamp but an archive without the bases (here: one of the device's own files): the probe finds none, so it is not trusted

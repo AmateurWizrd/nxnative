@@ -109,12 +109,15 @@ class Plan(unittest.TestCase):
         self.shader('fsx', {'entry': 'main1'}, {'_b': [('main0', False)]})
         self.shader('fsp', {'raster': {'primitive_id': 1}}, {'_b': [('main0', False)]})   # reads the primitive ID: no base
         self.shader('mesh', {'entry_z': 'main0_z', 'mesh_stage': {'kind': 'ms'}}, {'_b': vz})   # a mesh shader's pair (for its padding): built at the draw, no base
+        self.shader('fst', {'border_twin': '_bs'}, {'_b': [('main0', False)], '_bs': [('main0_bs', False)]})   # border color twins: a second base, the twin entry point
+        self.shader('fsn', {'border_twin': '_bs'}, {'_b': [('main0', False)]})   # its twin library missing: the plain base alone
         pairs = [('pull', 'fs'), ('plain', 'fs'), ('inputs', 'fs'), ('layer', 'fs'), ('other', 'fs'), ('nolib', 'fs'), ('pull', 'fsc'), ('pull', 'fsx'), ('pull', 'gone'), ('pull', 'fs'),
-                 ('plain', 'fsp'), ('mesh', 'fs')]
+                 ('plain', 'fsp'), ('mesh', 'fs'), ('pull', 'fst'), ('pull', 'fsn')]
         bases, rest, left = po.plan(self.d, CHAIN, pairs, False)
-        self.assertEqual(bases, [('pull_bp', 'main0', 'fs_b', 'main0'), ('plain_b', 'main0', 'fs_b', 'main0')])
+        self.assertEqual(bases, [('pull_bp', 'main0', 'fs_b', 'main0'), ('plain_b', 'main0', 'fs_b', 'main0'),
+                                 ('pull_bp', 'main0', 'fst_b', 'main0'), ('pull_bp', 'main0', 'fst_bs', 'main0_bs'), ('pull_bp', 'main0', 'fsn_b', 'main0')])
         self.assertEqual(rest, [('pull', 'fsc')])
-        self.assertEqual(left, {'reflection': 2, 'mesh': 1, 'stage inputs': 1, 'library': 1, 'layer': 1, 'primitive ID': 1, 'entry': 1})
+        self.assertEqual(left, {'reflection': 2, 'mesh': 1, 'stage inputs': 1, 'library': 1, 'layer': 1, 'primitive ID': 1, 'entry': 1, 'twin': 1})
         bases, _, _ = po.plan(self.d, CHAIN, pairs[:2], True)   # near = 0: the entry_z entries
         self.assertEqual(bases, [('pull_bp', 'main0_z', 'fs_b', 'main0'), ('plain_b', 'main0_z', 'fs_b', 'main0')])
 

@@ -10,8 +10,8 @@
 #     through a base every primitive reads 0), a missing library or entry point
 #   · a pair whose functions declare function constants is left to the device (rest_pairs.tsv): the host specializes such functions with an empty set of values, and metal-tt makes
 #     no specialized function from a library (applegpu-nt: "cannot find private metadata"), nor the function unspecialized ("cannot lower module with unresolved function constants")
-#   · the entry point is the plain one, which a shader with border color twins (<key>_bs, dmsh_build.py border_twin) has without the correction: a draw whose samplers need it takes the twin
-#     (nvn_mtl.m bs_fn, pso_key.bs), whose pipeline the device builds on its first use and lists in pso_user.tsv for the next start's prewarm
+#   · the entry point is the plain one, which a shader with border color twins (<key>_bs, dmsh_build.py border_twin) has without the correction; such a pair has a second base, the twin
+#     entry point <entry>_bs from <key>_bs, so a draw whose samplers need the correction (nvn_mtl.m bs_fn, pso_key.bs) has its stand-in (hybrid_get) while its pipeline is built
 # And a compute pipeline per compute shader, which depends on its function alone (the host makes it from the function, cps_new in nvn_mtl.m; the threadgroup size is the dispatch's):
 # the C rows of the profile's prewarm list (pso_manifest.tsv, recorded, in order), then every compute shader of its shader map (shader_map.tsv, stage compute), so a game whose list
 # names none (a provisional profile) still has them; per shader <key>_b, entry `entry`. Left out as the host would not find them: a reflection of another chain version or none, a
@@ -130,7 +130,7 @@ def plan(lib_dir, chain, pairs, zero):
     def writes_layer(lib):
         if lib not in layer: layer[lib] = LAYER in (lib_dir / f'{lib}.metallib').read_bytes()
         return layer[lib]
-    bases, rest, seen, left = [], [], set(), dict.fromkeys(('reflection', 'mesh', 'stage inputs', 'library', 'layer', 'primitive ID', 'entry'), 0)
+    bases, rest, seen, left = [], [], set(), dict.fromkeys(('reflection', 'mesh', 'stage inputs', 'library', 'layer', 'primitive ID', 'entry', 'twin'), 0)
     for vk, fk in pairs:
         vj, fj = refl(vk), refl(fk)
         if not vj or not fj or vj.get('chain') != chain or fj.get('chain') != chain: left['reflection'] += 1; continue
@@ -147,6 +147,12 @@ def plan(lib_dir, chain, pairs, zero):
         if vf[ventry] or ff[fentry]: rest.append((vk, fk)); continue
         b = (vl, ventry, fl, fentry)
         if b not in seen: seen.add(b); bases.append(b)
+        tw = fj.get('border_twin')   # the twin base (header); a missing twin library or entry point the host finds missing too, and draws without the correction
+        if tw:
+            tl, te = fk + tw, fentry + tw; tf = fn(tl)
+            if tf is None or te not in tf: left['twin'] += 1
+            elif tf[te]: rest.append((vk, fk))
+            elif (t := (vl, ventry, tl, te)) not in seen: seen.add(t); bases.append(t)
     return bases, rest, left
 
 

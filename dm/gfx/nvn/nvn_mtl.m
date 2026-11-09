@@ -2409,7 +2409,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[158];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[160];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -7514,31 +7514,36 @@ static int pso_mixed_uint(const pso_key *k, NvShader *fs, int merged) {
 // Border color twins (dmsh_build.py border_twin): a shader that samples through samplers Metal has no border color for has its entry points built without the correction, and each one's twin
 // <entry>_bs with it, in the library <key>_bs. A draw takes the twin only when one of its samplers needs the correction (bs_key, kept in pso_key.bs): nearly every draw takes the plain entry
 // point, whose pipeline has no correction code in it. The twin of any function pso_desc chose (the integer-output, dual-source, readable-tile, alpha test and logic operation ones too) is the entry
-// point of that name with the suffix, specialized with the same constants. Its pipeline is built when first drawn (the pipeline archive holds the plain ones) and its prewarm row names it
-static os_unfair_lock g_bs_lock = OS_UNFAIR_LOCK_INIT; static NSMapTable *g_bs_fn;   // a function made from a shader's libraries → its twin (NSNull: it has none)
+// point of that name with the suffix, specialized with the same constant values. The pipeline archive holds the twin base of each pair (pre_twin) as the first draw's stand-in, and its prewarm row names it
+static os_unfair_lock g_bs_lock = OS_UNFAIR_LOCK_INIT; static NSMapTable *g_bs_fn;   // a function made from a shader's libraries → its twin (NSNull: it has none); g_bs_lock guards the map alone
 static id<MTLFunction> bs_fn(NvShader *fs, id<MTLFunction> f) {   // f's twin, the library loaded on first need; nil for a function that is not one of fs's, and for a twin that cannot be used (a red line: the draw goes without the correction)
+    if (!fs->has_bs) return nil;
     MTL4FunctionDescriptor *d = fn4_of(f);
-    if (!d || !fs->has_bs) return nil;
+    if (!d) { RED_ONCE(159, "border color twin: a function of shader %s has no library record (not made by shader_load): drawn without the correction", fs->key); return nil; }
     MTL4SpecializedFunctionDescriptor *sd = [d isKindOfClass:MTL4SpecializedFunctionDescriptor.class] ? (MTL4SpecializedFunctionDescriptor *)d : nil;
     NSString *name = [(MTL4LibraryFunctionDescriptor *)(sd ? sd.functionDescriptor : d) name];
-    os_unfair_lock_lock(&g_bs_lock);
-    id c = [g_bs_fn objectForKey:f];
-    if (!c) {
-        if (!g_bs_fn) g_bs_fn = [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory capacity:0];
-        NSError *e = nil; const char *why = NULL; id<MTLFunction> t = nil;
-        if (!fs->bslib_state) {
-            size_t kl = strlen(fs->key); NSString *path = [NSString stringWithFormat:@"%@/%.*s" DMSH_BORDER_FN ".metallib", g_msl_dir, (int)(kl > 2 ? kl - 2 : kl), fs->key];
-            fs->bslib = lib_from_file(path, &e); fs->bslib_state = fs->bslib ? 1 : 2;
+    os_unfair_lock_lock(&g_bs_lock); id c = [g_bs_fn objectForKey:f]; os_unfair_lock_unlock(&g_bs_lock);
+    if (!c) @synchronized (fs) {   // one shader's twin loads once; a thread that needs another shader's does not wait for this library load and specialization
+        os_unfair_lock_lock(&g_bs_lock); c = [g_bs_fn objectForKey:f]; os_unfair_lock_unlock(&g_bs_lock);
+        if (!c) {
+            NSError *e = nil; const char *why = NULL; id<MTLFunction> t = nil;
+            if (!fs->bslib_state) {
+                size_t kl = strlen(fs->key); NSString *path = [NSString stringWithFormat:@"%@/%.*s" DMSH_BORDER_FN ".metallib", g_msl_dir, (int)(kl > 2 ? kl - 2 : kl), fs->key];
+                fs->bslib = lib_from_file(path, &e); fs->bslib_state = fs->bslib ? 1 : 2;
+            }
+            NSString *twin = [name stringByAppendingString:@DMSH_BORDER_FN];
+            if (!fs->bslib) why = "no library";
+            else if (!(t = fn_spec(fs->bslib, twin, sd ? sd.constantValues : [MTLFunctionConstantValues new], &e))) why = "no entry point";
+            else if (fs->rf.nb && [t newArgumentEncoderWithBufferIndex:fs->rf.abi].encodedLength != fs->arg_len) { why = "its argument buffer differs from the base library's"; t = nil; }
+            if (why) { static _Atomic int n; if (n++ < 8) MLOG("[RED] border color twin %s of %s not usable (%s%s%s): a draw that needs the correction goes without it", twin.UTF8String, fs->key, why, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); }
+            else { static _Atomic int n; int m = ++n; if (m <= 8 || !(m & (m - 1))) MLOG("border color correction: %s of %s loaded (%d twins so far)", twin.UTF8String, fs->key, m); }
+            c = t ? (id)t : (id)NSNull.null;
+            os_unfair_lock_lock(&g_bs_lock);
+            if (!g_bs_fn) g_bs_fn = [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory capacity:0];
+            [g_bs_fn setObject:c forKey:f];
+            os_unfair_lock_unlock(&g_bs_lock);
         }
-        NSString *twin = [name stringByAppendingString:@DMSH_BORDER_FN];
-        if (!fs->bslib) why = "no library";
-        else if (!(t = fn_spec(fs->bslib, twin, sd ? sd.constantValues : [MTLFunctionConstantValues new], &e))) why = "no entry point";
-        else if (fs->rf.nb && [t newArgumentEncoderWithBufferIndex:fs->rf.abi].encodedLength != fs->arg_len) { why = "its argument buffer differs from the base library's"; t = nil; }
-        if (why) { static int n; if (n++ < 8) MLOG("[RED] border color twin %s of %s not usable (%s%s%s): a draw that needs the correction goes without it", twin.UTF8String, fs->key, why, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); }
-        else { static int n; if (++n <= 8 || !(n & (n - 1))) MLOG("border color correction: %s of %s loaded (%d twins so far)", twin.UTF8String, fs->key, n); }
-        c = t ? (id)t : (id)NSNull.null; [g_bs_fn setObject:c forKey:f];
     }
-    os_unfair_lock_unlock(&g_bs_lock);
     return c == NSNull.null ? nil : c;
 }
 // NVN's alpha test (ColorStateSetAlphaTest and SetAlphaRef; Maxwell's fixed-function test of the alpha a pixel shader writes to colour 0, before blending): Metal has none.
@@ -8501,6 +8506,7 @@ static int hybrid_on(void) {
 }
 static nvn_hmap g_pso_hy = {.klen = sizeof(pso_key)};   // pulling pipelines by the key they stand in for (submit thread)
 static int g_pso_pull;   // the pipeline pso_get_ returned reads its vertex streams through the layout block
+static uint32_t g_pso_bs;   // the key's bs of the pipeline pso_get_ looked up last (draw compares it with the bindings now)
 static _Atomic uint64_t g_hy_draws, g_hy_made, g_hy_none, g_hy_kicked, g_hy_ns;   // draws with a pulling pipeline, pulling pipelines made, misses with no pulling base ready, pulling bases built for later, time
 static NSMutableSet<NSData *> *g_hy_kick_set; static os_unfair_lock g_hy_lock = OS_UNFAIR_LOCK_INIT;
 static MTLRenderPipelineDescriptor *pso_desc_pull(const pso_key *k, NvShader *vs, NvShader *fs) {   // pso_desc's pipeline with the pulling entry point and no vertex descriptor
@@ -8606,21 +8612,34 @@ static MTL4RenderPipelineDescriptor *pre_desc(NSString *vk, NSString *fk, int ze
         a.rgbBlendOperation = a.alphaBlendOperation = MTLBlendOperationUnspecialized; }
     return m;
 }
+// The base of a pixel shader's border color twins (bs_fn): the base m with the twin entry point from <key>_bs, as pso_desc_pull makes it for a draw that needs the correction; nil without twins
+static MTL4RenderPipelineDescriptor *pre_twin(MTL4RenderPipelineDescriptor *m, NSString *fk) {
+    NSDictionary *fj = pre_json(fk); if (![fj[@"border_twin"] isEqual:@DMSH_BORDER_FN]) return nil;
+    NSError *e = nil; id<MTLLibrary> bl = lib_from_file([NSString stringWithFormat:@"%@/%@" DMSH_BORDER_FN ".metallib", g_msl_dir, fk], &e);
+    MTL4FunctionDescriptor *bf = bl ? pre_fn(bl, [(fj[@"entry"] ?: @"main0") stringByAppendingString:@DMSH_BORDER_FN]) : nil;
+    if (!bf) return nil;
+    MTL4RenderPipelineDescriptor *t = [m copy]; t.fragmentFunctionDescriptor = bf;
+    return t;
+}
+static void pre_base(MTL4RenderPipelineDescriptor *m, NSString *vk, NSString *fk) {   // one base: found in an archive, or built into this device's
+    for (id<MTL4Archive> a in g_arch4p) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
+    for (id<MTL4Archive> a in g_arch4) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
+    NSError *e = nil; id ps = arch_capture(m, &e, 0, NULL);
+    if (ps) g_pre_built++;
+    else {
+        if (g_pre_failed++ < 4) MLOG("[RED] pipeline prebuild: the base of %s + %s failed: %s", vk.UTF8String, fk.UTF8String, e.localizedDescription.UTF8String);
+        NSString *why = [[[e.localizedDescription ?: @"no error" componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                          filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]] componentsJoinedByString:@" "];
+        os_unfair_lock_lock(&g_pre_fail_lock); [g_pre_fails addObject:[NSString stringWithFormat:@"fail\t%@\t%@\t%@", vk, fk, why]]; os_unfair_lock_unlock(&g_pre_fail_lock);
+    }
+}
 static void pre_pair(NSString *vk, NSString *fk, int zero) {
     @autoreleasepool {
         if (g_pre_known.count && g_pre_known[[NSString stringWithFormat:@"%@\t%@", vk, fk]]) { g_pre_skipped++; g_pre_known_n++; return; }
         MTL4RenderPipelineDescriptor *m = pre_desc(vk, fk, zero);
         if (!m) { g_pre_skipped++; return; }
-        for (id<MTL4Archive> a in g_arch4p) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
-        for (id<MTL4Archive> a in g_arch4) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
-        NSError *e = nil; id ps = arch_capture(m, &e, 0, NULL);
-        if (ps) g_pre_built++;
-        else {
-            if (g_pre_failed++ < 4) MLOG("[RED] pipeline prebuild: the base of %s + %s failed: %s", vk.UTF8String, fk.UTF8String, e.localizedDescription.UTF8String);
-            NSString *why = [[[e.localizedDescription ?: @"no error" componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
-                              filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]] componentsJoinedByString:@" "];
-            os_unfair_lock_lock(&g_pre_fail_lock); [g_pre_fails addObject:[NSString stringWithFormat:@"fail\t%@\t%@\t%@", vk, fk, why]]; os_unfair_lock_unlock(&g_pre_fail_lock);
-        }
+        pre_base(m, vk, fk);
+        MTL4RenderPipelineDescriptor *t = pre_twin(m, fk); if (t) pre_base(t, vk, fk);   // a failed twin marks the pair as failed: later starts leave both to the draws
     }
 }
 // What a prebuild covers (prebuilt.tsv): the chain version, the depth mode, and the pair lists' length in bytes and SHA-256 (first 16 hex digits). dm/gfx/tools/pso_offline.py writes
@@ -8785,9 +8804,9 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
     g_pso_pull = 0;   // set again only where a pulling pipeline is returned: a stale 1 made the next draw, whose pipeline came from the cache, bind the layout block instead of its streams
     __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
     if (!vs) { RED_ONCE(13, "program has no vertex shader (or it is not mapped)"); return nil; }
-    pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL);
+    pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL); g_pso_bs = k.bs;
     if (S.rast_discard) {
-        k.fsfn = DISCARD_MARK;
+        k.fsfn = DISCARD_MARK; k.bs = 0;   // no fragment stage: no twin (g_pso_bs keeps the bindings' value, so the draw does not ask again)
         id<MTLRenderPipelineState> cached = hm_get_id(&g_pso, &k);
         if (cached) return cached;
         if (hm_get_id(&g_pso_fail, &k)) return nil;
@@ -9865,7 +9884,7 @@ static uint32_t bs_key(NvShader *fs) {
     os_unfair_lock_lock(&g_rmu);
     for (int i = 0; i < fs->rf.nb && !need; i++) {
         const nvn_rbind *b = &fs->rf.b[i]; int sid;
-        if (b->bw && (sid = samp_bind_id(1, b)) > 0 && sid < g_nsreg && samp_fast(sid) && g_sview_w[sid]) need = 1;
+        if (b->bw && (sid = samp_bind_id(1, b)) > 0 && sid < g_nsreg && g_sreg_ok[sid] && samp_fast(sid) && g_sview_w[sid]) need = 1;   // g_sreg_ok first: the lookahead keys draws whose samplers are not registered yet (samp_by_id's red line)
     }
     os_unfair_lock_unlock(&g_rmu);
     return need;
@@ -12888,16 +12907,17 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     }
     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
-    static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass; static int cur_pull;   // cur_pull: a hybrid (pulling) pipeline, asked for again at the next draw
+    static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass; static int cur_pull; static uint32_t cur_bs;   // cur_pull: a hybrid (pulling) pipeline, asked for again at the next draw
     if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
     else if (g_fb_tseq == g_draw_seq && g_fb_tfn && !g_defer_replaying) { g_pso_lmap = g_fb_tlmap; g_pso_fsfn = g_fb_tfn; g_pso_fz = g_fb_tdesc; g_pso_dirty = 1; }   // same-pass feedback read from the tile (fb_tile_plan)
     if (g_mtk.on) { cur_ps = mtk_pso(pr); cur_pull = 0; cur_pr = nil; if (!cur_ps) { g_mtk.miss = 1; return; } }   // a task / mesh draw (mesh_tasks_draw)
     else if (g_geo_mesh.on) { cur_ps = geo_mesh_pso(pr); cur_pull = 1; cur_pr = nil; if (!cur_ps) { g_geo_mesh.miss = 1; return; } }   // a mesh draw (geo_mesh_draw): pulls its streams; the next draw fetches its own pipeline; none yet: the compute path draws
-    else if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial) { g_pso_amp = g_sm_pass; cur_ps = pso_get(pr, nil); g_pso_amp = 0; cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps || cur_pull; }
+    // bs_key: a texture / sampler bind or a handle in a uniform buffer changes whether the border twin is needed without making the pipeline state dirty (the plain entry point has no correction)
+    else if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || bs_key(pr->sh[1]) != cur_bs) { g_pso_amp = g_sm_pass; cur_ps = pso_get(pr, nil); g_pso_amp = 0; cur_pull = g_pso_pull; cur_bs = g_pso_bs; cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps || cur_pull; }
     if (!cur_ps && g_sm_pass) {   // a draw whose amplified pipeline is not built yet (sm_amp_get queued it): the slice-merged pass ends and the draw opens a pass of its own
         g_sm_nwait++; PD("M %llu slice-merged pass: no amplified pipeline yet for vertex %s fragment %s; split here", g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-");
         rp_end(); en = rp_begin_ex(mode); if (!en) return;
-        cur_ps = pso_get(pr, nil); cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps || cur_pull; }
+        cur_ps = pso_get(pr, nil); cur_pull = g_pso_pull; cur_bs = g_pso_bs; cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps || cur_pull; }
     uint32_t raster_mask = draw_color_writes(pr);   // Capture the physical mapping before resetting the merged pipeline state.
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
