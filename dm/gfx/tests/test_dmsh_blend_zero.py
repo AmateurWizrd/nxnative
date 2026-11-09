@@ -85,6 +85,13 @@ class BlendZero(unittest.TestCase):
         b = dmsh_side.body(out)
         self.assertNotIn('dm_az(out', out[b[0]:b[2]])
 
+    def test_guard_survives_the_compile_unit(self):   # ps_libraries compiles dmsh_side.unit's text, not blend_zero's
+        out, _ = blend_zero(shared_form(PLAIN))
+        src, info = dmsh_side.unit(out)
+        self.assertTrue(src, info)
+        self.assertEqual(body_of(src, 'main0'), body_of(out, 'main0'))
+        self.assertNotIn('dm_az', body_of(src, 'main0_u'))
+
     def test_integer_outputs_only(self):
         src = PLAIN.replace('float4 m_79 [[color(0)]];', 'uint4 m_79 [[color(0)]];').replace('float4 m_81 [[color(1)]];', 'uint4 m_81 [[color(1)]];')
         self.assertEqual(blend_zero(src), (src, 0))

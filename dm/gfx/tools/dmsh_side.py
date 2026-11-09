@@ -98,10 +98,10 @@ def unit(msl) -> tuple[str | None, dict]:
     if not alpha and not logic: return None, {'why': no_alpha or no_logic or 'no colour output'}
     thin = [a for a in alpha.values() if a] + [o[0] for o in logic.values()]; targets = set().union(*(o[1] for o in logic.values()))
     src, at = [], es[0]['start']
-    shared = bool(_BODY.search(msl))   # main0 already calls dm_body_main0 (shared_body): it is made again below as it is
+    shared = bool(_BODY.search(msl))   # main0 already calls dm_body_main0 (shared_body): it is kept below as it is, with what it does to the result (dmsh_build.py blend_zero)
     for e in es:
         src += [msl[at:e['start']]] + ([] if shared and e['name'] == 'main0' else [f'static {e["ret"]} dm_body_{e["name"]}({e["decl"]})', msl[e['head']:e['end']]]); at = e['end']
-    plain = [f'{e["attr"]}fragment {e["ret"]} {e["name"]}({", ".join(e["params"])})\n{{\n    return dm_body_{e["name"]}({e["args"]});\n}}\n' for e in es]
+    plain = [msl[e['start']:e['end']] + '\n' if shared and e['name'] == 'main0' else f'{e["attr"]}fragment {e["ret"]} {e["name"]}({", ".join(e["params"])})\n{{\n    return dm_body_{e["name"]}({e["args"]});\n}}\n' for e in es]
     return msl[:es[0]['start']] + dmsh_alpha.HELPER + dmsh_logic.HELPER + dmsh_logic.constants(targets) + ''.join(src) + msl[at:] + '\n' + ''.join(plain + thin), {'alpha': list(alpha), 'logic': list(logic)}
 
 
