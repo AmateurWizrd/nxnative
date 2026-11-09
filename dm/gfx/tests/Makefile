@@ -610,3 +610,7 @@ check_t_pool_seen_replace: t_pool_seen_replace
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_pool_seen_replace
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./t_pool_seen_replace
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 DM_NVN_POOL_SEEN_KEEP=0 ./t_pool_seen_replace
+# Indirect cache range proof, including input offsets past output capacity.
+t_ixc_ranges: t_ixc_ranges.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ $< $(MTL_T_SRC) $(FW)
+check_t_ixc_ranges: RUN_ENV = MTL_DEBUG_LAYER=1
