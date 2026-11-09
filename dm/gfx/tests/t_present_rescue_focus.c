@@ -12,3 +12,7 @@ extern int test_game_fps;
 int test_game_fps_now(void) { return test_game_fps; }
 extern int test_covered;
 int front_window_covered(void) { return test_covered; }
+extern int test_screen_hz;
+int front_screen_max_fps(void) { return test_screen_hz; }
+extern int test_match_fps;
+void front_screen_match(int fps) { test_match_fps = fps; }   // the rate link_sync asks the screen for

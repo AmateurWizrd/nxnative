@@ -138,7 +138,8 @@ static void vertex_dump(NvShader *vs, const p_draw *dw, const p_draw_idx *di) {
     vbuf_prepare(&vs->rf, &range, NULL);   // the vertices the capture reads: streams it reads past get zeros there (vbuf_need)
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     MTL4RenderPassDescriptor *rd = [MTL4RenderPassDescriptor new]; rd.renderTargetWidth = rd.renderTargetHeight = rd.defaultRasterSampleCount = 1;
-    id<MTL4RenderCommandEncoder> en = enc_r_begin(rd); enc_r_pso(en, ps); bind_vbufs(en);
+    id<MTL4RenderCommandEncoder> en = enc_r_begin(rd); enc_r_pso(en, ps);
+    { int bad = bind_vbufs(en, &vs->rf); if (bad >= 0) { RED_ONCE(158, "vertex stream %d's buffer %#llx is in no memory pool; draw skipped", bad, (unsigned long long)S.vbuf[bad].address); enc_r_end(en); return; } }
     vconv_bind(en, vs, 1, &range, NULL); args_dirty_all(); encode_args(en, vs, 0, 1); enc_r_vbuf(en, 13, gpu);
     enc_r_draw_instanced(en, MTLPrimitiveTypePoint, lo, span, 1, (uint32_t)info[3]); enc_r_end(en);
     mdi_wait();
@@ -594,8 +595,7 @@ static id<MTLRenderPipelineState> mtk_build(const pso_key *k, NvShader *ts, NvSh
     MTL4MeshRenderPipelineDescriptor *m4 = g_comp4 ? mtk_desc4(d, ts, ms, ff) : nil;
     if (m4) {
         id<MTLRenderPipelineState> ps = nil; int from_run = 0;
-        for (id<MTL4Archive> a in g_arch4p) if ((ps = [a newRenderPipelineStateWithDescriptor:m4 error:nil])) break;   // a period of mesh pipelines alone is a p file (no vertex layout)
-        if (!ps) for (id<MTL4Archive> a in g_arch4) if ((ps = [a newRenderPipelineStateWithDescriptor:m4 error:nil])) { from_run = 1; break; }
+        ps = arch_lookup(m4, 0, &from_run);   // a period of mesh pipelines alone is a p file (no vertex layout)
         if (ps) {
             g_mtk_arch++; if (archived) *archived = 1;
             if (from_run && g_compact_enabled && atomic_load(&g_warm_running)) arch_harvest(m4, 1);
@@ -983,7 +983,11 @@ static void geo_capture_one(id<MTL4RenderCommandEncoder> re, const geo_job *j) {
     if (!j->capture_words) return;
     g_draw_binst = j->first_instance;
     memset(g_vbuf_need, 0, sizeof g_vbuf_need);   // a later draw's bounds do not apply here (geo_prepare)
-    enc_r_pso(re, j->capture); bind_vbufs(re);
+    enc_r_pso(re, j->capture);
+    {   // the capture shares its encoder with the job's other stages, which read what it writes: it is not skipped alone, and the stream's slot keeps an earlier buffer
+        int bad = bind_vbufs(re, &j->vs->rf);
+        if (bad >= 0) RED_ONCE(160, "vertex stream %d's buffer %#llx is in no memory pool; a geometry capture reads the buffer bound before", bad, (unsigned long long)S.vbuf[bad].address);
+    }
     vconv_bind(re, j->vs, 1, &j->vertex_range, NULL);
     args_dirty_all(); encode_args(re, j->vs, 0, 1); enc_r_vbuf(re, 13, j->capture_info);
     if (j->nruns) for (size_t r = 0; r < j->nruns; r++) {
