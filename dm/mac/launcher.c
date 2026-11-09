@@ -85,14 +85,17 @@ static void debug_logging(const char *logs, const char *id) {
     fprintf(stderr, "launcher: debug logging (GPU timings every 60 frames, pipeline waits, memory to %s)\n", getenv("DM_MEMSTAT"));
 }
 // DM_LOG_COPY=<folder> (~/… for the home folder): after each run this run's log, and with DM_DEBUG its memory table, are copied there as "<title ID> <date time> <Mac model>.log":
-// a folder shared through iCloud Drive brings a tester's logs to the one who shares it, with nothing to send by hand
+// a folder shared through iCloud Drive brings a tester's logs to the one who shares it, with nothing to send by hand. The folder is never made here: a share not accepted yet would
+// otherwise become a private folder of the same name, whose logs reach nobody (a red line in the local log instead). The copy carries the tester's paths (user name, cloud folder)
 static void log_copy(const char *log, const char *id) {
     const char *d = getenv("DM_LOG_COPY"), *home = getenv("HOME"); if (!d || !*d) return;
-    char dir[PATH_MAX], dst[PATH_MAX], model[64] = "Mac", ts[32]; size_t n = sizeof model - 1; time_t t = time(NULL);
+    char dir[PATH_MAX], dst[PATH_MAX], model[64] = "Mac", ts[32]; size_t n = sizeof model - 1; time_t t = time(NULL); struct stat st;
     if (d[0] == '~' && d[1] == '/' && home) snprintf(dir, sizeof dir, "%s/%s", home, d + 2); else snprintf(dir, sizeof dir, "%s", d);
-    sysctlbyname("hw.model", model, &n, NULL, 0); strftime(ts, sizeof ts, "%Y-%m-%d %H%M%S", localtime(&t)); mkdirs(dir);
-    fflush(stdout); fflush(stderr);
+    if (stat(dir, &st) || !S_ISDIR(st.st_mode)) { fprintf(stderr, "[RED] launcher: DM_LOG_COPY folder %s does not exist (a shared folder not accepted yet, or iCloud Drive off): log not copied\n", dir); return; }
+    sysctlbyname("hw.model", model, &n, NULL, 0); strftime(ts, sizeof ts, "%Y-%m-%d %H%M%S", localtime(&t));
     snprintf(dst, sizeof dst, "%s/%s %s %s.log", dir, id, ts, model);
+    fprintf(stderr, "launcher: log copied to %s\n", dst);   // before the copy, so the copy says where it went
+    fflush(stdout); fflush(stderr);
     if (copyfile(log, dst, NULL, COPYFILE_DATA)) { fprintf(stderr, "[RED] launcher: the log was not copied to %s: %s\n", dir, strerror(errno)); return; }
     const char *m = getenv("DM_MEMSTAT");
     if (m && getenv("DM_DEBUG") && !strcmp(getenv("DM_DEBUG"), "1")) { snprintf(dst, sizeof dst, "%s/%s %s %s.memstat.tsv", dir, id, ts, model); copyfile(m, dst, NULL, COPYFILE_DATA); }
@@ -239,15 +242,15 @@ int main(int argc, char **argv) {
     if (*lang) setenv("DM_LANG", lang, 0);
     setenv("DM_WINDOW", "1", 0); setenv("DM_AUDIO", "1", 0);
     programs_table(contents, res, sup);
-    if (chdir(sup)) { fprintf(stderr, "[RED] launcher: cannot enter %s\n", sup); return 1; }
+    if (chdir(sup)) { fprintf(stderr, "[RED] launcher: cannot enter %s\n", sup); log_copy(log, id); return 1; }
     struct sigaction sa = {.sa_handler = forward};   // no SA_RESTART: waitpid below sees EINTR and waits again
     sigemptyset(&sa.sa_mask);
     sigaction(SIGTERM, &sa, NULL); sigaction(SIGINT, &sa, NULL); sigaction(SIGHUP, &sa, NULL);
     char *host_argv[] = {host, dm, NULL};
     int err = posix_spawn(&g_child, host, NULL, NULL, host_argv, environ);
-    if (err) { fprintf(stderr, "[RED] launcher: cannot start %s: %s\n", host, strerror(err)); return 1; }
+    if (err) { fprintf(stderr, "[RED] launcher: cannot start %s: %s\n", host, strerror(err)); log_copy(log, id); return 1; }
     int status;
-    while (waitpid(g_child, &status, 0) < 0) if (errno != EINTR) return 1;
+    while (waitpid(g_child, &status, 0) < 0) if (errno != EINTR) { fprintf(stderr, "[RED] launcher: lost the host: %s\n", strerror(errno)); log_copy(log, id); return 1; }
     // Cloud saves (DM_SAVE_SYNC, dm/host/save_sync.h): what the host committed and had not sent yet goes now, after a crash too (the committed save is whole whatever the host was doing)
     // DM_SAVE as the host had it: an env file or the launch environment may have set another folder than this app's own
     if (!save_sync_after_exit(getenv("DM_SAVE"), id)) fprintf(stderr, "launcher: the save did not reach the cloud; it goes at the next start\n");

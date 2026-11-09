@@ -160,7 +160,7 @@ class Structure(unittest.TestCase):
         after = entry.split('if (!simd_any(dm_miss))')[1].split('uint np =')[0]
         self.assertIn('dm_stage_body(spvDescriptorSet0, gl_SubgroupInvocationID, _60, dm_h0, dm_h1);', after)
         self.assertIn('((device uint4*)&_60[0])[i] = uint4(0u);', after)   # the stage memory zero again, and its inputs filled again, as at the start
-        self.assertIn('_60[0] = dm_first[0] + dm_tg;', after)
+        self.assertIn('_60[0] = dm_block.first + dm_tg;', after)
         self.assertIn('atomic_store_explicit(dm_slot, (dm_n != 0u ? dm_n : dm_s & 8191u) | min(dm_bad + 1u, 9u) << 13, memory_order_relaxed);', after)
         self.assertIn('uint dm_n = simd_max(max(dm_h0, dm_h1));', after)   # the entry it ended on, and one more miss counted
         slot = int(re.search(r'dm_scr \+ (\d+);', entry)[1]); self.assertTrue(1 <= slot < abi.MESH_SCRATCH_HEAD // 4)   # not the ticket's word 0
@@ -279,11 +279,12 @@ int main(int argc, char **argv) {
         u[0] = (uint32_t)guest[0]; u[1] = guest[0] >> 32; u[2] = (uint32_t)guest[1]; u[3] = guest[1] >> 32; u[4] = (uint32_t)guest[2]; u[5] = guest[2] >> 32; u[6] = 0x10000000; u[7] = 0x20;   // u[6..7]: an address in no pool
         u[8] = 0; u[9] = 0; u[11] = 0x10000;   // the last word of a 64 KiB pool: offset u[11] - 16 from pool A (kind 5 reads pool A's end)
         id<MTLBuffer> arg = buf(16); ((uint64_t *)arg.contents)[0] = ub.gpuAddress; ((uint64_t *)arg.contents)[1] = table.gpuAddress;
-        id<MTLBuffer> first = buf(16);
+        id<MTLBuffer> draw = buf(16); ((uint32_t *)draw.contents)[0] = groups;   // the object function's {count, first} (dmsh_meshstage.py main0_o)
         id<MTLBuffer> scratch = buf(ABI_HEAD + (size_t)ABI_SLICES * ABI_STRIDE);
         id<MTLTexture> c = tex(MTLPixelFormatRGBA8Unorm), d = tex(MTLPixelFormatDepth32Float);
         MTLMeshRenderPipelineDescriptor *pd = [MTLMeshRenderPipelineDescriptor new];
         pd.meshFunction = [lib(@"mesh") newFunctionWithName:entry]; pd.fragmentFunction = [lib(@"frag") newFunctionWithName:@"dm_frag"]; pd.maxTotalThreadsPerMeshThreadgroup = 32;
+        pd.objectFunction = [lib(@"mesh") newFunctionWithName:@"main0_o"]; pd.payloadMemoryLength = 16; pd.maxTotalThreadsPerObjectThreadgroup = 1;   // a mesh shader with no task: blocks of ABI_GRID workgroups
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm; pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         NSError *err = nil; id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithMeshDescriptor:pd options:MTLPipelineOptionNone reflection:nil error:&err];
         if (!ps) { printf("pipeline: %s\n", err.localizedDescription.UTF8String); return 1; }
@@ -295,8 +296,8 @@ int main(int argc, char **argv) {
         id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp]; [e setRenderPipelineState:ps]; [e setDepthStencilState:ds];
         [e useResource:ub usage:MTLResourceUsageRead stages:MTLRenderStageMesh]; [e useResource:table usage:MTLResourceUsageRead stages:MTLRenderStageMesh];
         for (int k = 0; k < 3; k++) [e useResource:pool[k] usage:MTLResourceUsageRead stages:MTLRenderStageMesh];
-        [e setMeshBuffer:arg offset:0 atIndex:0]; [e setMeshBuffer:first offset:0 atIndex:ABI_FIRST]; [e setMeshBuffer:scratch offset:0 atIndex:ABI_SCRATCH];
-        [e drawMeshThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)]; [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        [e setObjectBuffer:draw offset:0 atIndex:ABI_DRAW]; [e setMeshBuffer:arg offset:0 atIndex:0]; [e setMeshBuffer:scratch offset:0 atIndex:ABI_SCRATCH];
+        [e drawMeshThreadgroups:MTLSizeMake((groups + ABI_GRID - 1) / ABI_GRID, 1, 1) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)]; [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) { printf("failed: %s\n", cb.error.localizedDescription.UTF8String); return 1; }
         static uint32_t px[W * H]; [c getBytes:px bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
         FILE *f = fopen([[dir stringByAppendingString:@"/out.bin"] UTF8String], "wb"); fwrite(px, 4, W * H, f); fclose(f);
@@ -320,7 +321,7 @@ class OnTheGpu(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(); cls.root = Path(cls.tmp.name)
         runner = RUNNER.replace('ABI_HEAD', str(abi.MESH_SCRATCH_HEAD)).replace('ABI_SLICES', str(abi.MESH_SCRATCH_SLICES)).replace('ABI_STRIDE', str(abi.MESH_SCRATCH_STRIDE)) \
-            .replace('ABI_FIRST', str(abi.MESH_FIRST_SLOT)).replace('ABI_SCRATCH', str(abi.MESH_SCRATCH_SLOT))
+            .replace('ABI_DRAW', str(abi.MESH_DRAW_SLOT)).replace('ABI_GRID', str(abi.MESH_GRID)).replace('ABI_SCRATCH', str(abi.MESH_SCRATCH_SLOT))
         (cls.root / 'run.m').write_text(runner)
         subprocess.run(['clang', '-fobjc-arc', '-O1', '-Wno-nontrivial-memaccess', str(cls.root / 'run.m'), '-framework', 'Metal', '-framework', 'Foundation', '-o', str(cls.root / 'run')], check=True, capture_output=True)
         cls.dirs = {}
