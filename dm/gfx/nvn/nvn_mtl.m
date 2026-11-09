@@ -102,6 +102,8 @@ static int g_classic_ok, g_classic;   // mtl_device_classic was asked / the devi
 static dispatch_queue_t g_feedback_q;
 static _Atomic uint32_t g_present_qos;
 #define ALLOC_MAX 8
+// DM_LOWMEM=1 (the Mac launcher's "Low memory (8 GB, experimental)"): 4 command allocators instead of ALLOC_MAX (each keeps 36-80 MB of command memory), and no pipeline prewarm unless DM_PSO_MANIFEST names a list
+static int lowmem(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_LOWMEM"); v = e && !strcmp(e, "1"); } return v; }
 static id<MTL4CommandAllocator> g_alloc4[ALLOC_MAX]; static int g_alloc_n, g_alloc_cur;   // Command allocator pool of the main submission: at start pick one the GPU has finished with, create a new one if there is none (wait only at the cap)
 static id<MTL4CommandAllocator> g_up_alloc4[3];
 static id<MTL4CommandAllocator> g_present_alloc4[3];
@@ -1342,7 +1344,7 @@ void mtl_sub_begin(void) {
     // pick an allocator the GPU has finished with; if all are in use create a new one; only at the cap wait for the oldest one. How far ahead it runs is bounded by the wait where the game acquires the swapchain texture, same as the old interface.
     int alloc_i = -1; uint64_t done = g_done;
     for (int i = 0; i < g_alloc_n; i++) if (g_alloc_fence[i] <= done) { alloc_i = i; break; }
-    if (alloc_i < 0 && g_alloc_n < ALLOC_MAX) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
+    if (alloc_i < 0 && g_alloc_n < (lowmem() ? 4 : ALLOC_MAX)) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
         g_alloc4[g_alloc_n] = [g_dev newCommandAllocatorWithDescriptor:ad error:&ae]; if (!g_alloc4[g_alloc_n]) MDIE("failed to create a new MTL4CommandAllocator: %s", ae.localizedDescription.UTF8String);
         alloc_i = g_alloc_n++; g_alloc_grown++; }
     if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; mtl_wait_at(g_alloc_fence[alloc_i], UINT64_MAX, WS_ALLOC); }
@@ -9129,7 +9131,7 @@ static void prepare_prebuild(void) {
 static void warm_start(void) {
     if (g_warm_started++) return;
     const char *e = getenv("DM_PSO_MANIFEST");
-    if (e && !strcmp(e, "off")) return;
+    if ((e && !strcmp(e, "off")) || (!e && lowmem())) { if (!e) MLOG("DM_LOWMEM=1: no pipeline prewarm, pipelines are built when first drawn"); return; }
     NSArray<NSString *> *paths;
     if (e && *e) {
         paths = @[@(e)];
