@@ -425,6 +425,32 @@ def border_emu(msl):
         twin = f'spvDescriptorSet0.{m.group(2)}{abi.BORDER_TWIN}'
         msl = msl[:m.start()] + f'dm_bs({msl[m.start():i]}, spvDescriptorSet0.{abi.BORDER_MEMBER}, {bit[m.group(2)]}u, spvDescriptorSet0.{m.group(1)}, {twin}, {args})' + msl[i:]
     return msl.replace('using namespace metal;\n', 'using namespace metal;\n' + BORDER_HELPERS, 1)
+# A colour output's rgb where its alpha is exactly 0 and the rgb is not finite. NVIDIA's blender takes a zero factor times anything as 0 (Direct3D's rule: 0 × Inf = 0 × NaN = 0), so a pixel
+# shader may leave garbage in the colour of a pixel it means to add nothing to and say so with alpha 0: with SRC_ALPHA blending the target keeps its value. Apple's blender multiplies as IEEE
+# does (0 × NaN = NaN), stores the NaN, and every later pass that reads the target spreads it.
+# Ocarina of Time's half-resolution light shader 5ad65c0eefd09c7f averages hit positions over a fog layer whose density is 0 there (a positive hit count, a weight sum of 0: 1/0 × 0 = NaN; its
+# FMULs carry no .FMZ, so the translation is exact) and writes them with alpha 0 into an RGBA16F light target blended SRC_ALPHA / ONE_MINUS_SRC_ALPHA. The fog pass carried the NaN into the
+# scene and bloom turned each into a white cloud over the ferns at the camera, coming and going as they swayed across the fog volume's surface.
+# So main0, the entry a pipeline with float colour targets takes, returns a non-finite rgb as 0 where alpha is 0: a finite output is never changed, and neither are the integer entry points
+# (main0_u / main0_m: dm_body_main0, dmsh_side.shared_body), whose outputs are bits. Outside SRC_ALPHA blending the change only touches outputs that were NaN or Inf already
+BLEND_ZERO = ('static inline __attribute__((always_inline)) float4 dm_az(float4 c)   // see blend_zero\n'
+              '{\n    return c.w == 0.0f ? float4(select(c.xyz, float3(0.0f), isnan(c.xyz) || isinf(c.xyz)), c.w) : c;\n}\n')
+def blend_zero(msl):
+    """→ (msl with each `return out;` line of main0 preceded by out.<m> = dm_az(out.<m>); for its float4 colour outputs and BLEND_ZERO before main0, the number of returns guarded).
+    Unchanged (0) when main0 has no float4 colour output, is not of a shape dmsh_side.entry knows, or returns other than on a line of its own"""
+    st = re.search(r'struct main0_out\s*\{(.*?)\};', msl, re.S)
+    cols = [nm for ty, nm, at in re.findall(r'^\s*(\w+)\s+(\w+)\s*(\[\[[^\]]*\]\])?;', st.group(1), re.M) if ty == 'float4' and 'color(' in at] if st else []
+    if not cols or 'dm_az(' in msl: return msl, 0
+    try: e = dmsh_side.entry(msl, 'main0')
+    except ValueError: return msl, 0
+    if not e or e['ret'] != 'main0_out': return msl, 0
+    body = msl[e['head']:e['end']]
+    n = len(re.findall(r'\breturn out;', body))
+    guard = ' '.join(f'out.{c} = dm_az(out.{c});' for c in cols)
+    body, k = re.subn(r'^([ \t]*)return out;$', lambda m: f'{m.group(1)}{guard}\n{m.group(1)}return out;', body, flags=re.M)
+    if not k or k != n: return msl, 0
+    return msl[:e['start']] + BLEND_ZERO + msl[e['start']:e['head']] + body + msl[e['end']:], k
+
 # gl_FragCoord.z against a depth the shader read. NVIDIA stores a fragment's depth as the z its pixel shader reads, so a shader can test a fragment against a depth image of its own surface and
 # find them equal. Apple's GPU stores a value below the [[position]].z its fragment shader reads at some pixels: by up to one ulp of z plus a fraction of the depth's step across a pixel
 # (dm/gfx/tests/t_zsnap.m: 0.2% of a perspective triangle's pixels, 2% of flat ones, none above, the largest gap one ulp plus 2^-23 of fwidth(z)); writing [[position]].z as the depth would
@@ -1838,6 +1864,9 @@ def finish(key, w, j, c1):
     else: fu = fd = None
     cs = border_split(src) if j['stage'] == 'cs' and not mesh else src   # a kernel's body twice, the border colour correction on the block's mask (see border_split); in the file, as a library is the compile of its .metal (dmsh_mtlcache.py)
     if cs != src: plain = src; open(msl, 'w').write(cs)
+    if j['stage'] == 'ps':   # main0 returns a non-finite rgb at alpha 0 as 0, as NVIDIA's blender takes a zero factor (see blend_zero); after the entry points that share main0's body
+        bz, nbz = blend_zero(open(msl).read())
+        if nbz: open(msl, 'w').write(bz)
     try: binds = reflect(key, mesh['kind'] if mesh else j['stage'], src, res)   # before the compile: a pixel shader's readable-tile version needs its texture slots (ps_libraries)
     except ValueError as e: return 'reflection failed', str(e)[:160], None
     side, lost = {}, []
