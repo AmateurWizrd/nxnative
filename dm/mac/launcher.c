@@ -11,6 +11,7 @@
 // what the launch environment and the env files set (DM_ENV_LAUNCH_KEYS, DM_ENV_FILE_KEYS). DM_LAUNCHER=0 or --no-launcher (open <app> --args --no-launcher) starts the game without the window,
 // with the saved choices; so does "Show this window at launch" turned off.
 #include <CoreFoundation/CoreFoundation.h>
+#include <copyfile.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -22,7 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include "romfs_image.h"
 #include "save_sync.h"
@@ -71,6 +74,28 @@ static void mkdirs(const char *path) {   // mkdir -p
     char p[PATH_MAX]; snprintf(p, sizeof p, "%s", path);
     for (char *s = p + 1; *s; s++) if (*s == '/') { *s = 0; mkdir(p, 0755); *s = '/'; }
     mkdir(p, 0755);
+}
+
+// DM_DEBUG=1 (the settings window's Debug logging): more in the log for whoever reads it, as defaults the environment and env files still override: GPU pass timings one frame in 60,
+// pipeline waits over 20 ms, and memory accounting once a second into <logs>/<title ID>.memstat.tsv (copied with the log, log_copy)
+static void debug_logging(const char *logs, const char *id) {
+    const char *d = getenv("DM_DEBUG"); if (!d || strcmp(d, "1")) return;
+    char p[PATH_MAX]; snprintf(p, sizeof p, "%s/%s.memstat.tsv", logs, id);
+    setenv("DM_NVN_GPUPROF", "every:60", 0); setenv("DM_PSO_WAITLOG", "1", 0); setenv("DM_MEMSTAT", p, 0);
+    fprintf(stderr, "launcher: debug logging (GPU timings every 60 frames, pipeline waits, memory to %s)\n", getenv("DM_MEMSTAT"));
+}
+// DM_LOG_COPY=<folder> (~/… for the home folder): after each run this run's log, and with DM_DEBUG its memory table, are copied there as "<title ID> <date time> <Mac model>.log":
+// a folder shared through iCloud Drive brings a tester's logs to the one who shares it, with nothing to send by hand
+static void log_copy(const char *log, const char *id) {
+    const char *d = getenv("DM_LOG_COPY"), *home = getenv("HOME"); if (!d || !*d) return;
+    char dir[PATH_MAX], dst[PATH_MAX], model[64] = "Mac", ts[32]; size_t n = sizeof model - 1; time_t t = time(NULL);
+    if (d[0] == '~' && d[1] == '/' && home) snprintf(dir, sizeof dir, "%s/%s", home, d + 2); else snprintf(dir, sizeof dir, "%s", d);
+    sysctlbyname("hw.model", model, &n, NULL, 0); strftime(ts, sizeof ts, "%Y-%m-%d %H%M%S", localtime(&t)); mkdirs(dir);
+    fflush(stdout); fflush(stderr);
+    snprintf(dst, sizeof dst, "%s/%s %s %s.log", dir, id, ts, model);
+    if (copyfile(log, dst, NULL, COPYFILE_DATA)) { fprintf(stderr, "[RED] launcher: the log was not copied to %s: %s\n", dir, strerror(errno)); return; }
+    const char *m = getenv("DM_MEMSTAT");
+    if (m && getenv("DM_DEBUG") && !strcmp(getenv("DM_DEBUG"), "1")) { snprintf(dst, sizeof dst, "%s/%s %s %s.memstat.tsv", dir, id, ts, model); copyfile(m, dst, NULL, COPYFILE_DATA); }
 }
 
 static void env_file(const char *path) {   // KEY=VALUE lines, # starts a comment; a variable already set stays
@@ -204,7 +229,7 @@ int main(int argc, char **argv) {
     int shown = window ? dm_mac_launcher() : 2;
     if (!shown) return 0;   // Quit: no game
     if (shown == 2) saved_choices();
-    cloud_saves_folder();
+    cloud_saves_folder(); debug_logging(logs, id);
     setenv("DM_ROOT", sup, 0); setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
     snprintf(p, sizeof p, "%s/msl", res); setenv("DM_MSL_DIR", p, 0);
     snprintf(p, sizeof p, "%s/font", dm); setenv("DM_FONT_DIR", p, 0);
@@ -226,7 +251,8 @@ int main(int argc, char **argv) {
     // Cloud saves (DM_SAVE_SYNC, dm/host/save_sync.h): what the host committed and had not sent yet goes now, after a crash too (the committed save is whole whatever the host was doing)
     // DM_SAVE as the host had it: an env file or the launch environment may have set another folder than this app's own
     if (!save_sync_after_exit(getenv("DM_SAVE"), id)) fprintf(stderr, "launcher: the save did not reach the cloud; it goes at the next start\n");
-    if (WIFSIGNALED(status)) { fprintf(stderr, "launcher: the host stopped on signal %d\n", WTERMSIG(status)); return 128 + WTERMSIG(status); }
-    fprintf(stderr, "launcher: the host exited with %d\n", WEXITSTATUS(status));
-    return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) fprintf(stderr, "launcher: the host stopped on signal %d\n", WTERMSIG(status));
+    else fprintf(stderr, "launcher: the host exited with %d\n", WEXITSTATUS(status));
+    log_copy(log, id);   // after the exit line, so the copy ends with how the run ended
+    return WIFSIGNALED(status) ? 128 + WTERMSIG(status) : WEXITSTATUS(status);
 }

@@ -25,6 +25,7 @@ DM_CTL	diagnostic	`=<file>` (Mac): the host polls the file every 100 ms and runs
 DM_CTRL_PROMPT_TEXT	switch	The texts of the controller applet's prompt (a game wants more players than have joined; `ctrl_prompt.h`) in the player's language, one per line: the title, the hint, the count, the done and the cancel button, with `{min}`, `{max}` and `{joined}` replaced by the numbers; a front end sets it ([Starting a game](frontends.md#starting-a-game)), an empty or missing line keeps the English text
 DM_DBG	diagnostic	When set, prints the guest's `svcOutputDebugString` text to stderr as `[guest]` lines
 DM_DBG_AU_FRAMES	diagnostic	`=<frames>` asks the Mac's Core Audio output for that many frames per callback instead of about 5 ms (1024 reproduces the iOS default that caused crackling)
+DM_DEBUG	player	`1` (the Mac launcher's Debug logging): GPU pass timings one frame in 60 (`DM_NVN_GPUPROF=every:60`), pipeline waits over 20 ms (`DM_PSO_WAITLOG=1`) and memory accounting once a second into `~/Library/Logs/nxnative/<title ID>.memstat.tsv` (`DM_MEMSTAT`), each unless already set; costs some speed
 DM_DETCLOCK	switch	`=<step ns>`: from the first present on, the guest clock advances a fixed step per present instead of following the wall clock, and the random source becomes a fixed-seed stream (replay and test runs)
 DM_DETCLOCK_PACE	switch	`=1` with `DM_DETCLOCK`: each frame takes at least one clock step of wall time, so background loading keeps up with the fixed clock (used by the screenshot gate)
 DM_DISPLAY_NAME	switch	Overrides the iOS app's name in `build_ipa.sh` (default the game name in the base NSP's control data)
@@ -95,6 +96,7 @@ DM_LAUNCHER	switch	`0` skips the iOS settings screen or the Mac settings window 
 DM_LAUNCH_PARAM	path	File whose bytes `oe::TryPopLaunchParameter` returns once; `oe::ExecuteProgram` sets it for the program it starts
 DM_LINK_VTICK	switch	`0` keeps the system's display-link rate on 144 or 165 Hz Mac screens; by default the link counts only the refreshes nearest a steady 1/60 s clock
 DM_LOADHASH	diagnostic	`=1` logs an address-independent SHA-256 per module after loading
+DM_LOG_COPY	path	Mac app: after each run the launcher copies the run's log (and with `DM_DEBUG=1` its memory table) into this folder as `<title ID> <date time> <Mac model>.log`; `~/` is the home folder. A folder shared through iCloud Drive brings a tester's logs to whoever shares it
 DM_LONGFRAME	diagnostic	`0` turns off the long-frame log (on by default), a line for a frame over 20 ms or with GPU time over 16.7 ms that is clearly above recent frames
 DM_LOWMEM	player	`1` (the Mac launcher's "Low memory (8 GB, experimental)") for Macs with 8 GB: 4 command allocators instead of 8 (36-80 MB of command memory each) and no pipeline prewarm (`DM_PSO_MANIFEST` still names a list if set); pipelines are then built when first drawn, with short hitches
 DM_MEASURE_LOCK	path	`=<file>`: `scripts/regress.py`'s default `--lock`, the measuring lock `scripts/bench.py --lock` shares: held only while a game runs, and the harness's shader builds pause while another process holds it

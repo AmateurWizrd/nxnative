@@ -37,3 +37,4 @@ DM_NVN_ENC_THREAD	toggle	-	1|DM_GAME_ENC_THREAD	gfxapi:nvn	Performance	Encode th
 DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
 DM_LOWMEM	toggle	-	0	platform:mac	Performance	Low memory (8 GB, experimental)	For Macs with 8 GB: no pipeline prepare step (pipelines are built when first drawn, with short hitches) and fewer command buffers
 DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD
+DM_DEBUG	toggle	-	0	platform:mac	Performance	Debug logging	More detail in the log for whoever helps you: GPU timings, pipeline waits, memory once a second. A little slower.
