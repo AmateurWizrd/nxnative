@@ -222,6 +222,19 @@ int main(void) {
     snprintf(p, sizeof p, "%s/a", work); CHECK(same(p, "new"), "work directory a is back to the committed version new");
     snprintf(p, sizeof p, "%s/b", work); CHECK(same(p, "7"), "work directory b = the committed 7");
 
+    printf("⑤b a save path the host cannot look up (fork commit 566afc34)\n");
+    {   int nf = g_nfail; uint64_t lh;
+        CHECK(h_fs_CreateDirectory("save:/locked") == RES_OK, "make a folder in the save");
+        snprintf(p, sizeof p, "%s/locked", work); chmod(p, 0);   // its entries cannot be listed: name resolution fails with EACCES
+        CHECK(h_fs_OpenFile(&lh, "save:/locked/x", MODE_READ) != RES_OK, "a read lookup in it fails");
+        chmod(p, 0755); CHECK(h_fs_Commit("save") == RES_OK && g_nfail == nf, "and refuses no commit");
+        chmod(p, 0);
+        CHECK(h_fs_CreateFile("save:/locked/x", 0) != RES_OK, "creating a file in it fails");
+        chmod(p, 0755);
+        CHECK(h_fs_Commit("save") == RES_FAIL && g_nfail == nf + 1 && g_lasterr == EACCES, "that transaction's Commit is refused, errno=EACCES (actually %d)", g_lasterr);
+        CHECK(h_fs_Commit("save") == RES_OK && g_nfail == nf + 1, "the next transaction commits");
+    }
+
     printf("⑥ failed writes are handled without exiting (DM_TEST_FS_FAILAT)\n");
     unsetenv("DM_TEST_FS_FAIL");
     // 6a Recloning after a refused commit fails: do not exit, the work directory is untouched and the committed version unchanged; the next commit is refused again and the reclone succeeds; the transaction after that commits normally
