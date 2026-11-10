@@ -6,6 +6,7 @@ DM_ALLOW_OTHER_METAL	switch	`1` lets `own_compilers.py` build the shader librari
 DM_AOC_DIR	path	Folder of add-on content: one numbered subfolder per DLC index holding that DLC's RomFS, reported by `aoc` and mounted read-only; the app, the Mac launcher and the NSP script set it when the build has DLC
 DM_AOC_OWNED	switch	`0` reports no add-on content even when `DM_AOC_DIR` has some, for runs without the DLC
 DM_APP_DM	path	Set by the iOS app of a game of several programs: the running program's `dm/p<N>` folder, where the settings screen finds its `launcher.json`
+DM_APP_POOL	diagnostic	`=<MB>` caps what the application memory pool answers at launch for a Switch 2 game (hle_svc.c), to try a smaller footprint; unset, the game gets its own size
 DM_APP_VERSION	switch	Overrides the IPA's version in `build_ipa.sh`; by default it is the packed game's display version from its control data (the update's when one is packed)
 DM_AUDIO	switch	`1` plays audio through Core Audio, `0` uses the silent sink; real output is the default on iOS, the silent sink on the Mac (the Mac launcher sets `1`)
 DM_AUDIO_DUMP	diagnostic	`=<file>` writes every PCM block the game appends as is (16-bit, 48 kHz, channel count as in the OpenAudioOut log), to judge whether a sound played
@@ -128,6 +129,7 @@ DM_NVN_ALLOC_CAP	switch	Most main-submission command allocators and visibility b
 DM_NVN_API	switch	`=<major>.<minor>` overrides the NVN API version `nvnDeviceGetInteger` reports (by default decided by the SDK version or the profile's `device_api`: 55.15 for SDK 11 and later, 53.313 before)
 DM_NVN_BARRIER	switch	How draw passes are ordered: `full` (default) waits for all earlier GPU work, `game` lets only the next pass's vertex stage start before the previous pass is done (object, mesh and fragment stages wait) unless the game set a barrier, `ab` alternates with the `DM_AB` phases
 DM_NVN_BARRIER_FRAG	switch	`0` gives a draw pass the full consumer barrier after any game barrier; by default (with DM_NVN_BARRIER=game) a barrier that orders only fragments (ORDER_FRAGMENTS / _TILED, INVALIDATE_TEXTURE) leaves it out, as the last pass's relaxed end orders fragments already
+DM_NVN_BARRIER_HEAP	switch	`0` ends and begins every draw pass with the full barrier while image heaps (resolution families) are alive, as before; by default such passes take the relaxed end barrier too, so a pass's vertex work may overlap the previous pass's fragments
 DM_NVN_BC_ALIAS	diagnostic	Set 0 to send copies to an uncompressed alias instead of its block-compressed storage, for an A/B check; default 1
 DM_NVN_BF_WANT	path	`=<file>`: appends the key of each fragment shader whose passes could not be merged for lack of a readable-tile version to that file, once per key
 DM_NVN_BLIT_ORDER	diagnostic	`0` drops the barriers between dependent operations in the copy encoder, which reproduces the fountain's vertical stripes in Mario Wonder
@@ -175,7 +177,7 @@ DM_NVN_GEO_HOIST	switch	`0` draws each geometry draw's capture and kernel at its
 DM_NVN_GEO_LEAN	switch	`0` draws passthrough geometry shaders through their full kernel and reader, as before; by default a lean kernel culls and the program's own vertex shader draws (`nvn_geometry.inc`)
 DM_NVN_GEO_MESH	switch	`0` draws passthrough geometry pairs that have a mesh library (`geo_mesh.tsv`) through the compute path; by default they are mesh draws in the render pass (`geo_mesh_draw`)
 DM_NVN_GEO_MESH_RUN	switch	`0` dispatches every mesh geometry draw on its own; by default consecutive mesh draws of one pair whose result does not depend on their order are drawn as one dispatch (`geo_mesh_take`)
-DM_NVN_GHOST	diagnostic	
+DM_NVN_GHOST	diagnostic	`=<n>` (1 to 512): how many finalized texture serials keep their texture (the ghost ring); 512 by default. Ocarina of Time fills it with transient render targets: 1.6 GB of GPU memory, 154 MB at 64 (measured by the fork commit's author)
 DM_NVN_GPUPROF	diagnostic	`=<f>`, `<f1>-<f2>` or `every:<n>`: logs the GPU start and duration of every encoder of those frames (`[gpuprof]` lines from Metal 4 counter heap timestamps)
 DM_NVN_GPUPROF_GEOM	diagnostic	`=1` (with `DM_NVN_GPUPROF`) also stamps each render pass where its vertex and mesh stages finish; the pass line ends in `geom <us>` and `gpuprof.py` splits each pass into geometry and the time after it
 DM_NVN_GPU_TS	switch	`segment` or `submission`: what timestamp reports record (GPU start / end of the segment holding each report, or one time for the whole submission), instead of the profile's `gpu_timestamps`
