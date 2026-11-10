@@ -233,6 +233,12 @@ int main(void) {
         chmod(p, 0755);
         CHECK(h_fs_Commit("save") == RES_FAIL && g_nfail == nf + 1 && g_lasterr == EACCES, "that transaction's Commit is refused, errno=EACCES (actually %d)", g_lasterr);
         CHECK(h_fs_Commit("save") == RES_OK && g_nfail == nf + 1, "the next transaction commits");
+        CHECK(h_fs_CreateDirectory("save:/ro") == RES_OK, "make another folder");
+        snprintf(p, sizeof p, "%s/ro", work); chmod(p, 0555);   // listed, so the lookup succeeds; not writable, so the create itself fails
+        CHECK(h_fs_CreateFile("save:/ro/x", 0) != RES_OK, "a create that fails past its lookup");
+        chmod(p, 0755);
+        CHECK(h_fs_Commit("save") == RES_FAIL && g_nfail == nf + 2 && g_lasterr == EACCES, "refuses that transaction's Commit too, errno=EACCES (actually %d)", g_lasterr);
+        CHECK(h_fs_Commit("save") == RES_OK && g_nfail == nf + 2, "the next transaction commits");
     }
 
     printf("⑥ failed writes are handled without exiting (DM_TEST_FS_FAILAT)\n");
