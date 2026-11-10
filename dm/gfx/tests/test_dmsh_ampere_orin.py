@@ -46,7 +46,7 @@ KNOWN = {
     'shfl_idx': 'SHFL: a lane in a register is not masked to its low 5 bits', 'shfl_bfly': '(as shfl_idx)', 'shfl_idx_seg': '(as shfl_idx)',
     'f2fp_pack_bf16x2': 'F2FP.BF16.PACK_AB packs f16, not bf16', 'f2fp_pack_f16x2_relu': 'F2FP.RELU: negative results are not clamped to 0',
     'i2f_s64': 'I2F.S64 rounds twice (the high and low words apart)',
-    'hadd2_ftz': 'HADD2 / HMUL2 .FTZ: f16 denormals are not flushed (Metal keeps them)', 'hmul2_ftz': '(as hadd2_ftz)',
+
     'hmma_16816_f32': 'HMMA.16816.F32: the f32 accumulator does not add the products as the tensor core does (about 1 ULP)',
     # the translator refuses these
     'hfma2': 'HFMA2.MMA (0x235) is not implemented', 'hfma2_ftz': '(as hfma2)', 'hfma2_sat': '(as hfma2)', 'hfma2_relu': '(as hfma2)',
