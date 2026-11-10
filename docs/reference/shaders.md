@@ -1545,6 +1545,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** `.NE` is `a != b && !isnan(a) && !isnan(b)` (`InstEmitFloatComparison.cs` `GetFPComparison`). Metal keeps `isnan` under fast math, as the unordered comparisons already relied on.
 - **Check:** `test_dmsh_ampere_orin.py`'s `fsetp` and `fsetp_ftz` match the Orin (before: 800 of 16,384 cases each differed, every one with a NaN operand; what remains of `fsetp` is f32 denormal inputs, which Metal flushes).
 - **Found on:** no game; a Jetson Orin's results ([Ampere instructions checked against an Ampere GPU](#ampere-instructions-checked-against-an-ampere-gpu)). A scan of Ocarina of Time's shader code finds only a handful of FSETP.NE.
+### FMNMX and HMNMX2 order -0 below +0
+
+- **Symptom:** a float or half minimum or maximum of +0 and -0 can come out with the other sign than on the console: max(+0, -0) gives -0 where the GPU gives +0. It only shows where a shader later depends on the sign, such as a division by the result or a sign test.
+- **Cause:** NVIDIA's FMNMX and HMNMX2 treat -0 as less than +0 whatever the operand order, so the minimum of the two zeros is -0 and the maximum is +0. The translator emitted Metal's `fmin` and `fmax` (made `precise::` by the chain), which may return either zero.
+- **Fix:** where both operands are zeros, which an integer test on their bits finds (`((a | b) << 1) == 0`), the minimum is their bits ORed and the maximum their bits ANDed; otherwise `fmin` and `fmax` give the result as before. The test is on the bits, so a NaN keeps `fmin` and `fmax`'s own result and fast math, which assumes there are no signed zeros, can't fold it away. Ampere's FMNMX and HMNMX2 and Maxwell's FMNMX share the helper (`InstEmitAluHelper.FPMinMax`); Maxwell's DMNMX keeps the plain `fmin` and `fmax`. With the usual constant predicate an FMNMX adds an OR, a shift, an integer compare and a select, plus an AND for a maximum; with a register predicate it computes both sides.
+- **Check:** `test_dmsh_ampere_orin.py` (`fmax`, `hmax2` out of `KNOWN`): `fmax` goes from 2 differing lanes of 1,024 to 1 (a denormal input, which the test allows), `hmax2` from 7 of 2,048 to 7, all of them NaN bits now. The fixture's minimum ops with signed zeros (`fmin_nan`, `bmin2`) show the GPU giving -0 in both operand orders. A both-NaN half pair now comes out as Metal's canonical 0x7e00 rather than one of the inputs, which the test counts as NaN bits (`hmin2` 6 to 8 lanes, `hmax2` 6 to 7).
+- **Found on:** no game; a Jetson Orin's results ([Ampere instructions checked against an Ampere GPU](#ampere-instructions-checked-against-an-ampere-gpu)).
 
 ### The NDVE movie network by the host
 
