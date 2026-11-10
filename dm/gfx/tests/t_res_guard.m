@@ -30,23 +30,37 @@ static void levels(void) {
     CHECK(g_guard.stop == 950ull << 20 && g_guard.evict == 800ull << 20 && g_guard.wall == g_dev.recommendedMaxWorkingSetSize, "DM_NVN_RES_LIMIT_MB sets the stop and the eviction level under it");
     setenv("DM_NVN_RES_LIMIT_MB", "0", 1); memset(&g_guard, 0, sizeof g_guard);
 }
-// The guard reads the set's own size, so an addition counts from its commit
+// The guard counts the set as the commit will leave it: its additions (the set's own size has them only afterwards), less its removals, and shared buffers over the same pages once
 static void commits(void) {
     id<MTLBuffer> a = [g_dev newBufferWithLength:64 << 20 options:MTLResourceStorageModePrivate], b = [g_dev newBufferWithLength:64 << 20 options:MTLResourceStorageModePrivate];
     res_add(a); res_commit();
     uint64_t set = g_res.allocatedSize;
     res_add(b);
     CHECK(g_res.allocatedSize == set, "an addition is not in the set's size before its commit");
-    CHECK(guard_used(g_res.allocatedSize) == set, "the guard reads the set's size, not the device's");
-    g_guard.evict = 1; g_guard.stop = 2; g_guard.wall = 3;   // anything is past these
+    CHECK(guard_used(g_res.allocatedSize) == set, "with the guard off the size is the set's own");
+    g_guard.evict = g_guard.stop = g_guard.wall = set + (32ull << 20);   // under the working set now, past it with the 64 MB this commit adds
     res_commit();
+    CHECK(g_res_dirty && g_res.allocatedSize == set, "a commit whose additions would pass the working set is not made");
+    res_remove(a); res_commit();
+    CHECK(!g_res_dirty && g_res.allocatedSize == set, "with a removal of the same size in it, it is made: the set ends where it was");
+    g_guard.evict = 1; g_guard.stop = 2; g_guard.wall = 3;   // anything is past these
+    res_add(a); res_commit();
     CHECK(g_res_dirty && g_res_grew && g_res.allocatedSize == set, "a commit that adds is not made past the working set");
     CHECK(atomic_load(&g_guard_lv) == GUARD_WALL, "and leaves the level for the submit thread");
     pthread_mutex_lock(&g_res_mu); g_res_grew = 0; pthread_mutex_unlock(&g_res_mu);   // only removals left to commit
-    res_remove(a); res_commit();
-    CHECK(!g_res_dirty, "removals go through past it");
-    memset(&g_guard, 0, sizeof g_guard); atomic_store(&g_guard_lv, GUARD_OK);
     res_remove(b); res_commit();
+    CHECK(!g_res_dirty, "removals go through past it");
+    pthread_mutex_lock(&g_res_mu); uint64_t one = guard_used(g_res.allocatedSize); pthread_mutex_unlock(&g_res_mu);
+    CHECK(atomic_load(&g_guard_set) == one, "the timer's copy of the size is the one after the commit");
+    // The set's size counts each of four buffers over one 64 MB region, 256 MB; their pages are wired once
+    g_guard.evict = 1; g_guard.stop = g_guard.wall = UINT64_MAX;
+    size_t len = 64u << 20; void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); memset(p, 1, len);
+    id<MTLBuffer> ov[4]; for (int i = 0; i < 4; i++) { ov[i] = [g_dev newBufferWithBytesNoCopy:p length:len options:MTLResourceStorageModeShared deallocator:nil]; res_add(ov[i]); }
+    res_commit();
+    CHECK(atomic_load(&g_guard_set) == one + len, "four shared buffers over the same 64 MB count as 64 MB");
+    for (int i = 0; i < 4; i++) res_remove(ov[i]);
+    memset(&g_guard, 0, sizeof g_guard); atomic_store(&g_guard_lv, GUARD_OK);
+    res_remove(a); res_commit();
 }
 static void eviction(void) {
     static pool_t pool = {.magic=MAGIC('P','O','O','L')};
@@ -80,13 +94,20 @@ static void stop(void) {
     g_guard.evict = 1; g_guard.stop = UINT64_MAX - 1; g_guard.wall = UINT64_MAX;
     atomic_store(&g_guard_lv, GUARD_EVICT); guard_act(g_fence);
     CHECK(!stops && !atomic_load(&g_guard_lv), "the eviction level does not stop");
-    // Over the stop level, but what the eviction frees brings it under: the game goes on
+    // Over the stop level by less than the eviction lets go. That leaves behind the next submission: the game goes on (looking at once, before it, stopped here)
+    settle();   // closes the upload batch eviction() left open: up_trim keeps its hands off the slots while one is
+    id<MTLBuffer> staging = [g_dev newBufferWithLength:64 << 20 options:MTLResourceStorageModePrivate]; res_add(staging); res_commit(); g_up_slot_blk[1] = staging; staging = nil;
+    g_guard.stop = g_res.allocatedSize - (32ull << 20);
     atomic_store(&g_guard_lv, GUARD_STOP); guard_act(g_fence);
-    CHECK(!stops, "the stop level looks again after the eviction");
+    CHECK(!stops && atomic_load(&g_guard_lv) == GUARD_STOP, "the stop level lets go first and comes back after the next submission");
+    settle();
+    CHECK(!stops && g_res.allocatedSize < g_guard.stop, "what the eviction let go brought the set under the level: no stop");
     g_guard.stop = 2; g_guard.wall = UINT64_MAX;
     atomic_store(&g_guard_lv, GUARD_STOP); guard_act(g_fence);
-    CHECK(stops == 1, "still over: the game stops");
-    atomic_store(&g_guard_lv, GUARD_STOP); guard_act(g_fence); guard_tick();
+    CHECK(!stops, "over with nothing to let go: still the eviction's turn first");
+    settle();
+    CHECK(stops == 1, "still over after it: the game stops");
+    atomic_store(&g_guard_lv, GUARD_STOP); guard_act(g_fence); settle(); guard_tick();
     CHECK(stops == 1, "once");
 }
 // A submit thread stuck in the driver holds the residency lock: the timer takes the game down without it. Run in a process of its own, as the stop happens once

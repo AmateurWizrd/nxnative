@@ -9,7 +9,8 @@ module_t *module_of(const void *p) { (void)p; return NULL; }
 module_t *g_mod; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
-static int checks, failed;
+static int checks, failed; static volatile sig_atomic_t stops;
+static void on_term(int sig) { (void)sig; stops++; }   // front_gpu_memory_stop's weak default
 #define CHECK(c, s) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s\n", s); } } while (0)
 int main(void) { @autoreleasepool {
     setenv("DM_NVN_SYS_MARGIN_MB", "1048576", 1);   // a 1 TB margin: the system never has that much left
@@ -19,6 +20,8 @@ int main(void) { @autoreleasepool {
     CHECK(atomic_load(&g_sys_avail) > 0, "the system's available memory is read");
     CHECK(atomic_load(&g_sys_lv) == GUARD_STOP, "available memory under the margin: stop");
     CHECK(!g_guard.stop || guard_level(0) == GUARD_STOP, "guard_level takes the system side even with nothing resident");
+    signal(SIGTERM, on_term); atomic_store(&g_guard_lv, GUARD_STOP); guard_act(g_fence);
+    CHECK(!stops, "the submit thread does not stop for the system's side: one sample under the margin is not a second of them (guard_tick)");
     atomic_store(&g_sys_margin, 1ull << 20); guard_sys_tick();   // 1 MB: always more left than that
     CHECK(atomic_load(&g_sys_lv) == GUARD_OK, "available memory over twice the margin: no level");
     CHECK(!g_guard.stop || guard_level(0) == GUARD_OK, "and guard_level is back to the working-set side");

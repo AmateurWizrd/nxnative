@@ -293,7 +293,7 @@ static void ws_report(uint64_t frame, uint64_t frames) {
 static void cbt_stamp(MTL4CommitOptions *o);   // DM_NVN_TSV per-command-buffer GPU timing (below, before gpu_tag_begin); nvn_rec.h calls it where a commit really happens
 #include "nvn_rec.h"   // deferred encoding (DM_NVN_ENC_THREAD)
 static NSHashTable *g_res_objects;
-static int g_res_grew;   // the changes the next commit carries include an addition (g_res_dirty, under g_res_mu)
+static int g_res_grew; static uint64_t g_res_add_b, g_res_rm_b;   // the changes the next commit carries include an addition; the bytes its additions bring and its removals take (the set's own size has neither before the commit; an object added and removed in between is in both). With g_res_dirty, under g_res_mu
 static char g_tex_range_key;   // res_top: a GPU-made texture's storage (guest address, NVN size, pool flags)
 static _Atomic unsigned g_image_heap_n, g_big_n;   // g_big_n: large pools in chunks, whose buffers overlap (BIG_MIN)
 static inline MTL4VisibilityOptions resource_vis(void) { return MTL4VisibilityOptionDevice | (g_image_heap_n || g_big_n ? MTL4VisibilityOptionResourceAlias : 0); }
@@ -351,7 +351,7 @@ static void res_add_at(id<MTLAllocation> allocation, int line) { @autoreleasepoo
     { int k = 0; while (k < RS_SITES - 1 && g_rs_site[k].line && g_rs_site[k].line != line) k++; g_rs_site[k].line = line; g_rs_site[k].n++; g_rs_site[k].bytes += r.allocatedSize; }
     file_wire(r);
     [g_res addAllocation:(id<MTLAllocation>)r];
-    [g_res_objects addObject:r];
+    [g_res_objects addObject:r]; g_res_add_b += r.allocatedSize;
     g_res_dirty = g_res_grew = 1;
     pthread_mutex_unlock(&g_res_mu);
 } }
@@ -361,7 +361,7 @@ static void res_remove(id<MTLAllocation> r) { @autoreleasepool {
     pthread_mutex_lock(&g_res_mu);
     if (![g_res_objects containsObject:r]) { pthread_mutex_unlock(&g_res_mu); return; }
     [g_res removeAllocation:(id<MTLAllocation>)r];
-    [g_res_objects removeObject:r];
+    [g_res_objects removeObject:r]; g_res_rm_b += r.allocatedSize;
     g_res_dirty = 1; g_rs_rm++;
     pthread_mutex_unlock(&g_res_mu);
 } }
@@ -480,24 +480,27 @@ static void res_check(id r, const char *what, int reg) {
 }
 // GPU memory guard. GPU memory is wired, and the driver refuses to wire past Metal's working set (recommendedMaxWorkingSetSize: IOGPUScheduler freeToWireMemory fails there). The submit thread
 // then waits in the kernel, where nothing can kill the process: GitHub issue #1326 ended with a Mac frozen until the power button, PR #1319's 8 GB Mac with WindowServer's watchdog. So every commit
-// of the residency set looks first, by the set's own allocatedSize, which counts what has been committed. From about 80% of the working set the submit thread lets go of what can go (guard_evict); from about 95%, if that was not enough, the game stops: a [RED] line says
-// what the set holds and the front end leaves full screen and quits (front_gpu_memory_stop). A commit that adds to the set past the working set itself is not made at all. Callers of res_commit
+// of the residency set looks first, by the size this commit leaves the set at (guard_used). From about 80% of the working set the submit thread lets go of what can go (guard_evict); from about 95%, if that was not enough, the game stops: a [RED] line says
+// what the set holds and the front end leaves full screen and quits (front_gpu_memory_stop). A commit whose additions would take the set past the working set itself is not made at all. Callers of res_commit
 // can hold g_mu, so it only reads the sizes and leaves a level for the submit thread (guard_act). A stuck submit thread never comes back to look, so a 100 ms timer reads them too (guard_tick).
 // DM_NVN_RES_LIMIT_MB: =<MB> stops at that size instead (a low one tests this), =0 turns the guard off. On iOS the system ends a process for its footprint long before this, and no front end has
 // been tried with this stop, so there the guard only evicts unless the switch asks for a limit
 enum { GUARD_OK, GUARD_EVICT, GUARD_STOP, GUARD_WALL, GUARD_EVERY = 30, GUARD_TICKS = 10 };   // the evictions are at least GUARD_EVERY frames apart; the timer stops the game after GUARD_TICKS ticks over the stop level
 static struct { uint64_t evict, stop, wall; } g_guard;   // bytes, all 0 with the guard off: the eviction level, the stop level, the size no commit grows past
 static _Atomic int g_guard_lv;   // the highest level met since the submit thread last looked (guard_act)
-static _Atomic uint64_t g_guard_set;   // the residency set's size at the last commit: the timer does not read the set, whose lock a stuck commit holds
+static _Atomic uint64_t g_guard_set;   // what the guard counts of the residency set (guard_used) as of its last commit: the timer does not read the set, whose lock a stuck commit holds
 // The system's side of the guard: GPU memory is wired out of the same RAM as everything else, and on a 16 GB Mac the system can run out before the residency set reaches Metal's
 // working set. Ocarina of Time with every pool resident (DM_NVN_GMEM_ALL=1, M2 Pro, 12,124 MB working set): a kernel panic at 10,463 MB wired with 48 MB free (3 GB compressed),
 // under this guard's 95 % stop. So the 100 ms timer also reads how much memory the system can still give (kern.memorystatus_level: the percentage of memory available, free plus
 // reclaimable) and raises the level when that falls below the margin (stop) or twice the margin (evict). The margin starts at DM_NVN_SYS_MARGIN_MB (default 1024; 0 turns this
-// side off) and grows by 512 MB, up to 4 GB, at each memory-pressure warning the system sends. The working-set side counts as before (guard_used)
-static _Atomic int g_sys_lv;   // GUARD_OK / GUARD_EVICT / GUARD_STOP from the system's available memory, set by guard_tick
+// side off), grows by 512 MB, up to 4 GB, at each memory-pressure warning the system sends, and returns to its start when the system reports normal pressure again. For this side
+// the submit thread only evicts: no eviction of GPU memory changes the system's level, so the stop is the timer's, after GUARD_TICKS ticks under the margin, never one sample's.
+// The working-set side counts as before (guard_used)
+static _Atomic int g_sys_lv;   // GUARD_OK / GUARD_EVICT / GUARD_STOP from the system's available memory, set by guard_sys_tick
 static _Atomic uint64_t g_sys_avail, g_sys_margin;   // bytes the system can still give at the last tick, and the margin
+static int guard_own(uint64_t used) { return !g_guard.stop ? GUARD_OK : used >= g_guard.wall ? GUARD_WALL : used >= g_guard.stop ? GUARD_STOP : used >= g_guard.evict ? GUARD_EVICT : GUARD_OK; }   // the working-set side alone
 static int guard_level(uint64_t used) {
-    int lv = !g_guard.stop ? GUARD_OK : used >= g_guard.wall ? GUARD_WALL : used >= g_guard.stop ? GUARD_STOP : used >= g_guard.evict ? GUARD_EVICT : GUARD_OK;
+    int lv = guard_own(used);
     int sys = atomic_load_explicit(&g_sys_lv, memory_order_relaxed);
     return sys > lv ? sys : lv;
 }
@@ -514,28 +517,48 @@ static void guard_sys_tick(void) {
     if (lv && !said++) MLOG("[RED] GPU memory guard: the system has %llu MB left to give (%d %% available), under %s %llu MB margin", (unsigned long long)(avail >> 20), level,
                             lv == GUARD_STOP ? "the" : "twice the", (unsigned long long)(margin >> 20));
 }
-// The set's own size: currentAllocatedSize counts each no-copy buffer in full however many cover the same pages
-static uint64_t guard_used(uint64_t set) { return set; }
+static int range_cmp(const void *x, const void *y) { uintptr_t a = *(const uintptr_t *)x, b = *(const uintptr_t *)y; return a < b ? -1 : a > b; }
+// The shared (no-copy) buffers in the set, by whole pages: the bytes of distinct pages they cover, and in *sum those bytes counted once per buffer. Under g_res_mu
+static uint64_t res_shared(uint64_t *sum) { @autoreleasepool {
+    size_t nr = 0, cr = 256; uintptr_t (*rg)[2] = malloc(cr * sizeof *rg), pg = (uintptr_t)getpagesize() - 1; uint64_t uni = 0; *sum = 0;
+    for (id<MTLAllocation> o in g_res_objects.allObjects) {
+        if (!rg || ![(id)o conformsToProtocol:@protocol(MTLBuffer)] || ((id<MTLBuffer>)o).storageMode != MTLStorageModeShared) continue;
+        if (nr == cr) { void *more = realloc(rg, (cr *= 2) * sizeof *rg); if (!more) { free(rg); rg = NULL; continue; } rg = more; }
+        uintptr_t a = (uintptr_t)((id<MTLBuffer>)o).contents; rg[nr][0] = a & ~pg; rg[nr][1] = (a + ((id<MTLBuffer>)o).length + pg) & ~pg; *sum += rg[nr][1] - rg[nr][0]; nr++; }
+    if (!rg) { *sum = 0; return 0; }   // no memory for the list: sum = distinct, nothing comes off
+    qsort(rg, nr, sizeof *rg, range_cmp);
+    for (size_t i = 0, j; i < nr; i = j) { uintptr_t lo = rg[i][0], hi = rg[i][1]; for (j = i + 1; j < nr && rg[j][0] <= hi; j++) if (rg[j][1] > hi) hi = rg[j][1]; uni += hi - lo; }
+    free(rg); return uni;
+} }
+// What the guard counts of a set of that size. The set's allocatedSize counts each no-copy buffer in full however many cover the same pages, as the device's currentAllocatedSize does
+// (measured: four over one 64 MB region make 256 MB in both), while their pages are wired once, and a large pool's chunks overlap by 16 MB or more each: the overlap comes off. That
+// only lowers the size, so under the eviction level without it nothing is worked out. Under g_res_mu
+static uint64_t guard_used(uint64_t set) {
+    if (!g_guard.stop || set < g_guard.evict) return set;
+    uint64_t sum, uni = res_shared(&sum), over = sum - uni;
+    return set > over ? set - over : 0;
+}
 static void guard_raise(int lv) { int cur = atomic_load(&g_guard_lv); while (lv > cur && !atomic_compare_exchange_weak(&g_guard_lv, &cur, lv)) {} }
 static void guard_act(uint64_t fence);
 static void res_commit(void) {
     pthread_mutex_lock(&g_res_mu);
     if (g_res_dirty) {
-        uint64_t set = g_res.allocatedSize, used = guard_used(set); int lv = guard_level(used);
-        atomic_store_explicit(&g_guard_set, set, memory_order_relaxed);
+        uint64_t set = g_res.allocatedSize, to = set + g_res_add_b, after = to - MIN(g_res_rm_b, to), used = guard_used(after); int lv = guard_level(used);   // the set as this commit leaves it
+        atomic_store_explicit(&g_guard_set, used, memory_order_relaxed);
         if (lv) guard_raise(lv);
         if (lv == GUARD_WALL && g_res_grew) {   // removals alone always go through: they are what brings the set down
-            static uint64_t refused; if (!refused++) MLOG("[RED] GPU memory guard: %llu MB allocated at Metal's working set of %llu MB: this residency commit and any after it that add to the set are not made", (unsigned long long)(used >> 20), (unsigned long long)(g_guard.wall >> 20));
+            static uint64_t refused; if (!refused++) MLOG("[RED] GPU memory guard: %llu MB allocated with this commit's additions, at Metal's working set of %llu MB: this residency commit and any after it that add to the set are not made", (unsigned long long)(used >> 20), (unsigned long long)(g_guard.wall >> 20));
             file_unwire();   // the pages wired for the commit that is not made
             pthread_mutex_unlock(&g_res_mu); return;
         }
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); [g_res commit]; file_unwire(); g_res_dirty = g_res_grew = 0; g_rs_commits++; g_rs_commit_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        g_res_add_b = g_res_rm_b = 0;
+        set = g_res.allocatedSize; atomic_store_explicit(&g_guard_set, set - MIN(after - used, set), memory_order_relaxed);   // what the commit made of it, for the timer: a size from before a commit that takes transient buffers out stopped a game gone quiet
     }
     pthread_mutex_unlock(&g_res_mu);
 }
 // What the residency set holds: totals by kind and the largest objects. At the first GPU out-of-memory error (the error names none of them), and for DM_CTL "restop" (hle_hid.c). The set holds
 // the game's pools (shared buffers over guest memory), textures, heaps and staging alike
-static int range_cmp(const void *x, const void *y) { uintptr_t a = *(const uintptr_t *)x, b = *(const uintptr_t *)y; return a < b ? -1 : a > b; }
 static void res_top(const char *why) { @autoreleasepool {
     enum { N = 24 }; id<MTLAllocation> top[N] = {nil}; uint64_t total = 0, n = 0, kind[4] = {0}, count[4] = {0};
     pthread_mutex_lock(&g_res_mu);
@@ -548,18 +571,11 @@ static void res_top(const char *why) { @autoreleasepool {
          (unsigned long long)n, (unsigned long long)(total >> 20), (unsigned long long)(g_dev.recommendedMaxWorkingSetSize >> 20), (unsigned long long)(g_dev.currentAllocatedSize >> 20),
          (unsigned long long)count[0], (unsigned long long)(kind[0] >> 20), (unsigned long long)count[1], (unsigned long long)(kind[1] >> 20), (unsigned long long)count[2], (unsigned long long)(kind[2] >> 20), (unsigned long long)count[3], (unsigned long long)(kind[3] >> 20));
     // Shared buffers may overlap (a large pool's chunks): the pages they cover once; textures by pixel format
-    { enum { NF = 1024 }; uint64_t fb[NF] = {0}, fc[NF] = {0}; size_t nr = 0, cr = 256; uintptr_t (*rg)[2] = malloc(cr * sizeof *rg);
+    { enum { NF = 1024 }; uint64_t fb[NF] = {0}, fc[NF] = {0}, sum;
       pthread_mutex_lock(&g_res_mu);
-      for (id<MTLAllocation> o in g_res_objects.allObjects) {
-          if ([(id)o conformsToProtocol:@protocol(MTLTexture)]) { NSUInteger f = ((id<MTLTexture>)o).pixelFormat; if (f < NF) { fb[f] += o.allocatedSize; fc[f]++; } continue; }
-          if (![(id)o conformsToProtocol:@protocol(MTLBuffer)] || ((id<MTLBuffer>)o).storageMode != MTLStorageModeShared || !rg) continue;
-          if (nr == cr) { void *more = realloc(rg, (cr *= 2) * sizeof *rg); if (!more) { free(rg); rg = NULL; continue; } rg = more; }
-          rg[nr][0] = (uintptr_t)((id<MTLBuffer>)o).contents; rg[nr][1] = rg[nr][0] + ((id<MTLBuffer>)o).length; nr++; }
+      for (id<MTLAllocation> o in g_res_objects.allObjects) if ([(id)o conformsToProtocol:@protocol(MTLTexture)]) { NSUInteger f = ((id<MTLTexture>)o).pixelFormat; if (f < NF) { fb[f] += o.allocatedSize; fc[f]++; } }
+      uint64_t uni = res_shared(&sum);
       pthread_mutex_unlock(&g_res_mu);
-      uint64_t uni = 0;
-      if (rg) { qsort(rg, nr, sizeof *rg, range_cmp);
-          for (size_t i = 0, j; i < nr; i = j) { uintptr_t lo = rg[i][0], hi = rg[i][1]; for (j = i + 1; j < nr && rg[j][0] <= hi; j++) if (rg[j][1] > hi) hi = rg[j][1]; uni += hi - lo; }
-          free(rg); }
       char fs[512]; size_t fo = 0; fs[0] = 0;
       for (int q = 0; q < 8 && fo < sizeof fs; q++) { int best = -1; for (int f = 0; f < NF; f++) if (fb[f] && (best < 0 || fb[f] > fb[best])) best = f;
           if (best < 0) break; fo += snprintf(fs + fo, sizeof fs - fo, "%sformat %d: %llu, %llu MB", q ? ", " : "", best, (unsigned long long)fc[best], (unsigned long long)(fb[best] >> 20)); fb[best] = 0; }
@@ -764,7 +780,7 @@ static void guard_stop(uint64_t used) {
 static void guard_tick(void) {
     static unsigned over;
     guard_sys_tick();
-    uint64_t used = guard_used(atomic_load_explicit(&g_guard_set, memory_order_relaxed)); int lv = guard_level(used);
+    uint64_t used = atomic_load_explicit(&g_guard_set, memory_order_relaxed); int lv = guard_level(used);
     if (lv) guard_raise(lv);
     over = lv >= GUARD_STOP ? over + 1 : 0;
     if (lv == GUARD_WALL || over >= GUARD_TICKS) guard_stop(used);
@@ -783,9 +799,10 @@ static void guard_init(void) {
     dispatch_resume(timer);
     { const char *m = getenv("DM_NVN_SYS_MARGIN_MB"); uint64_t mb = m ? strtoull(m, NULL, 0) : 1024; atomic_store(&g_sys_margin, mb << 20);
       static dispatch_source_t press;
-      if (mb) { press = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0, DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-          dispatch_source_set_event_handler(press, ^{ uint64_t cur = atomic_load(&g_sys_margin), nm = cur + (512ull << 20); if (nm > (4096ull << 20)) nm = 4096ull << 20; atomic_store(&g_sys_margin, nm);
-              MLOG("GPU memory guard: the system reports memory pressure (%lu): the margin is now %llu MB", (unsigned long)dispatch_source_get_data(press), (unsigned long long)(nm >> 20)); guard_sys_tick(); });
+      if (mb) { press = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0, DISPATCH_MEMORYPRESSURE_NORMAL | DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+          dispatch_source_set_event_handler(press, ^{ unsigned long ev = dispatch_source_get_data(press);
+              uint64_t nm = ev & DISPATCH_MEMORYPRESSURE_NORMAL ? mb << 20 : MIN(atomic_load(&g_sys_margin) + (512ull << 20), 4096ull << 20); atomic_store(&g_sys_margin, nm);
+              MLOG("GPU memory guard: the system reports memory pressure (%lu): the margin is now %llu MB", ev, (unsigned long long)(nm >> 20)); guard_sys_tick(); });
           dispatch_resume(press); }
       MLOG("GPU memory guard: also stops when the system has less than %llu MB left to give (DM_NVN_SYS_MARGIN_MB; evicts below twice that)", (unsigned long long)mb); }
     MLOG("GPU memory guard: lets go of what it can from %llu MB, stops the game at %llu MB (Metal's working set %llu MB)", (unsigned long long)(g_guard.evict >> 20), (unsigned long long)(g_guard.stop >> 20), (unsigned long long)(ws >> 20));
@@ -3555,7 +3572,8 @@ static NSMutableArray *g_up_keep;
 // completed on the GPU, the whole pages inside the storage are replaced with zero pages (nvn_dirty_discard) when:
 //   - the pool is a plain (not virtual / sparse) pool that the residency set does not hold: a zero-copy buffer in the set has its pages wired and would keep the old ones;
 //   - CPU_NO_ACCESS pool (DM_TEX_RELEASE>=1): the game cannot write or read it, nothing can need the bytes again; CPU-visible pool (DM_TEX_RELEASE>=2): only pages that are still write-protected (not written
-//     since the upload, so no re-upload is pending), and they stay protected: a later game write faults as before. Left out: textures that are not a one-time packaged upload (no stamp in a CPU pool).
+//     since the upload, so no re-upload is pending), and they stay protected: a later game write faults as before. Left out: textures that are not a one-time packaged upload (no stamp in a CPU pool), and an
+//     initial fill (tex_init_fill, no stamp): it leaves no donor record, and a texture made again over its storage reads the storage again.
 // A pool finalized meanwhile drops its pending entries first (mtl_pool_del, same mutex), so a range the game may have reused is never touched. DM_TEX_RELEASE=probe only logs what it would do.
 typedef struct { uintptr_t lo, hi, pool; uint64_t bid; int tracked; } rel_ent;
 static rel_ent *g_rel; static int g_nrel, g_caprel; static uint64_t g_rel_bid; static pthread_mutex_t g_rel_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -4007,7 +4025,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         }
         if (enc_ok) {
             [g_up_texs addObject:mt];
-            rel_push(t, stamp != NULL);
+            if (stamp) rel_push(t, 1);
             if (!g_cb) up_flush();
             return mt;
         }
@@ -6977,16 +6995,24 @@ static void guard_evict(int force) { @autoreleasepool {
     static uint64_t lines; if (entries + spares + staging && lines++ < 16)
         MLOG("GPU memory guard: %llu MB allocated (it lets go from %llu MB): %u idle sharing entries, %u spare textures, %u staging blocks let go", (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)(g_guard.evict >> 20), entries, spares, staging);
 } }
-// On the submit thread, after a submission, with no lock held. The stop level gives the eviction its chance first: this submission's fence, then the sizes again
+// On the submit thread, after a submission, with no lock held. The stop level gives the eviction its chance first. What the eviction lets go leaves behind the next submission's fence
+// (defer_obj_release), so the sizes are read again after that submission, not this one: reading them at once stopped a game the eviction would have brought under the level. Only the
+// set's own size stops here: for the system's side this thread evicts, and the timer stops (guard_tick)
 static void guard_act(uint64_t fence) {
+    static uint64_t evicted;   // the fence the stop level's eviction leaves behind; 0: none waited for
     int lv = atomic_exchange(&g_guard_lv, GUARD_OK);
     if (!lv) return;
-    guard_evict(lv >= GUARD_STOP);
-    if (lv < GUARD_STOP) return;
-    mtl_wait_at(fence, 2000000000ull, WS_DRAIN);
+    if (!evicted) {
+        int stop = guard_own(atomic_load(&g_guard_set)) >= GUARD_STOP;
+        guard_evict(stop);
+        if (stop) { evicted = g_fence + 1; guard_raise(GUARD_STOP); }   // back here after the next submission
+        return;
+    }
+    if (fence < evicted) { guard_raise(GUARD_STOP); return; }
+    mtl_wait_at(evicted, 2000000000ull, WS_DRAIN); evicted = 0;
     defer_drain(); res_commit();
     pthread_mutex_lock(&g_res_mu); uint64_t used = guard_used(g_res.allocatedSize); pthread_mutex_unlock(&g_res_mu);
-    if (guard_level(used) >= GUARD_STOP) guard_stop(used);
+    if (guard_own(used) >= GUARD_STOP) guard_stop(used);
 }
 // Texture views by texture serial and view parameters, beside the per-ID view: KTGL (Age of Calamity) registers a texture into the next ID of a ring before every bind (about 21,000
 // registrations a frame in battle after the first cutscene, 5 in 6 of them a different texture than the ID held), so the per-ID view was rebuilt for nearly every bind: half the
