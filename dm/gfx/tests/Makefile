@@ -129,6 +129,12 @@ t_cpu_tex: t_cpu_tex.m $(MTL_T_DEP)
 t_dispatch_overlap: t_dispatch_overlap.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_overlap.m $(MTL_T_SRC) $(FW)
 check_t_dispatch_overlap: RUN_ENV = MTL_DEBUG_LAYER=1
+t_res_guard: t_res_guard.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_res_guard.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_res_guard
+check_t_res_guard: t_res_guard
+	MTL_DEBUG_LAYER=1 ./t_res_guard
+	MTL_DEBUG_LAYER=1 ./t_res_guard stuck
 .PHONY: check_t_cpu_tex
 check_t_cpu_tex: t_cpu_tex
 	MTL_DEBUG_LAYER=1 ./t_cpu_tex --metal
@@ -168,6 +174,8 @@ check_t_cbs_fault: t_cbs_fault
 t_bc_alias: t_bc_alias.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_bc_alias.m $(MTL_T_SRC) $(FW)
 check_t_bc_alias: RUN_ENV = MTL_DEBUG_LAYER=1
+t_guard_sys: t_guard_sys.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_guard_sys.m $(MTL_T_SRC) $(FW)
 t_tex_fit_root: t_tex_fit_root.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_tex_fit_root.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_tex_fit_root

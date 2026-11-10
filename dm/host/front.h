@@ -71,6 +71,11 @@ void front_save_failed(int err);
 // The Mac front end leaves full screen, says why in an alert and quits with exit status 70; without a window it ends the run as the default weak implementation (nvn_mtl.m) does, which the iOS
 // front end keeps: a FATAL line and an abort. Called on Metal's feedback queue; the front end switches to the main thread itself and must not block
 void front_gpu_lost(void);
+// GPU memory nearly full (called by the graphics backend's nvn_mtl.m guard_stop, once): the game's GPU memory reached about 95% of Metal's working set, the most the driver can wire, and nothing more
+// could be let go. Past the working set the submit thread would wait in the kernel, unkillable, with the Mac frozen. The Mac front end stops the game's GPU work and sound, leaves full screen, says
+// why in an alert and quits as ⌘Q does, so the launcher's work after the game runs; without a window, and on iOS, the run ends with the host's graceful exit (the weak default in nvn_mtl.m).
+// used_mb, limit_mb: what is allocated, and the working set. Any thread; the front end switches to its main thread and must not block
+void front_gpu_memory_stop(unsigned long long used_mb, unsigned long long limit_mb);
 
 // Offline HTML pages (the web applet's offline pages; hle_web.c): a web view over the game picture (web_apple.m, Mac and iPhone). Called from guest threads; the front end works on its main
 // thread. front_web_open: dir = the folder the document path is relative to (an HtmlDocument's html-document), path = the document path with its query, callback = the URL prefix whose

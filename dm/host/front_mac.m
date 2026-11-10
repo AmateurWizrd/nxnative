@@ -1740,28 +1740,25 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     return 1;
 }
 
-// GPU lost (front.h): macOS runs none of the game's GPU work any more and nothing is drawn again. In full screen the frozen game held the whole screen (#1326: WindowServer froze for 40 s
-// and its watchdog killed it), so the window leaves full screen first and the alert comes once it has, or after 3 s if it has not. Then the app quits with exit status 70
-// (EX_SOFTWARE), so a launcher or script that runs it sees a failed run: exit() runs the same atexit handlers as ⌘Q's terminate (the one will-terminate
-// observer, haptics_apple.m's, is an atexit handler too), whose exit status is 0
-void front_gpu_lost(void) {
-    if (!g_layer) die("GPU access revoked: macOS runs none of this process's GPU work any more");
-    LOG("front end: the GPU no longer runs the game's work; telling the player and quitting");
+// The game stops over a GPU problem. A stopped game in full screen holds the whole screen (GitHub issue #1326: WindowServer froze for 40 s and its watchdog killed it), so the window leaves
+// full screen first and the alert comes once it has, or after 3 s if it has not. Then the app quits: with exit status `status` when it is not 0 (exit() runs the same atexit handlers
+// as ⌘Q's terminate; the one will-terminate observer, haptics_apple.m's, is an atexit handler too), else as ⌘Q does. Any thread
+static void front_stop_alert(NSString *title, NSString *text, int status) {
     dispatch_async(dispatch_get_main_queue(), ^{
         __block int told = 0;
         void (^tell)(void) = ^{
             if (told++) return;
             NSAlert *a = [NSAlert new];
             a.alertStyle = NSAlertStyleCritical;
-            a.messageText = [@"The GPU stopped running " stringByAppendingString:@(DM_GAME_NAME)];   // @(): the name is UTF-8, which %s would not read as such
-            a.informativeText = [NSString stringWithFormat:@"After a GPU error, macOS stopped running the game's GPU work, so nothing more can be drawn and the game quits. The log has the details. "
-                                                           "Please report it on GitHub with python3 scripts/bug_report.py %@, which collects the log.", @(DM_GAME_ID)];
+            a.messageText = title;
+            a.informativeText = text;
             [a addButtonWithTitle:@"Quit"];
             // An app opened in the background would leave the alert behind other apps' windows, and DM_WINDOW_TOP's floating game window would cover it
             [NSApp activateIgnoringOtherApps:YES];
             [a layout]; NSWindow *game = g_win; if (game && a.window.level <= game.level) a.window.level = game.level + 1;
             [a runModal];
-            exit(70);
+            if (status) exit(status);
+            [NSApp terminate:nil];   // as ⌘Q
         };
         NSWindow *win = g_win;
         if (!(win.styleMask & NSWindowStyleMaskFullScreen)) { tell(); return; }
@@ -1769,4 +1766,22 @@ void front_gpu_lost(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), tell);
         [win toggleFullScreen:nil];
     });
+}
+// GPU lost (front.h): macOS runs none of the game's GPU work any more and nothing is drawn again. The app quits with exit status 70 (EX_SOFTWARE), so a launcher or script that runs
+// it sees a failed run
+void front_gpu_lost(void) {
+    if (!g_layer) die("GPU access revoked: macOS runs none of this process's GPU work any more");
+    LOG("front end: the GPU no longer runs the game's work; telling the player and quitting");
+    front_stop_alert([@"The GPU stopped running " stringByAppendingString:@(DM_GAME_NAME)],   // @(): the name is UTF-8, which %s would not read as such
+                     [NSString stringWithFormat:@"After a GPU error, macOS stopped running the game's GPU work, so nothing more can be drawn and the game quits. The log has the details. "
+                                                 "Please report it on GitHub with python3 scripts/bug_report.py %@, which collects the log.", @(DM_GAME_ID)], 70);
+}
+// GPU memory nearly full (front.h). The gate first, off the calling thread: dm_gfx_suspend waits for the submission in progress, which may be the caller, and no more GPU work may grow what is held
+void front_gpu_memory_stop(unsigned long long used_mb, unsigned long long limit_mb) {
+    if (!g_layer) { kill(getpid(), SIGTERM); return; }
+    LOG("front end: GPU memory is nearly full; telling the player and quitting");
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ dm_audio_suspend(1); dm_gfx_suspend(1); });
+    front_stop_alert([@(DM_GAME_NAME) stringByAppendingString:@" stopped: GPU memory is nearly full"],   // @(): the name is UTF-8, which %s would not read as such
+                     [NSString stringWithFormat:@"The game reached %llu MB of the %llu MB macOS can keep in GPU memory. Going on could freeze this Mac, so the game stops here; progress since your last save is lost. The log has the details. "
+                                                 "Please report it on GitHub with python3 scripts/bug_report.py %@, which collects the log.", used_mb, limit_mb, @(DM_GAME_ID)], 0);
 }
