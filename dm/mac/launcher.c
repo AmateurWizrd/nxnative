@@ -6,7 +6,8 @@
 // (the previous run's kept as <title ID>.prev.log). Environment switches: one KEY=VALUE per line in <Application Support folder>/env.txt, then Resources/dm/env.txt (the first one wins; neither
 // replaces a variable already set), as the iOS app reads Documents/env.txt and dm/env.txt. Then the player's saved choices: launcher.<VAR> strings in the app's preferences domain (its bundle ID), which a
 // front end or a settings window writes, each checked against the bundle's settings (Info.plist DMSettings, from launcher.json) and used only for a variable still unset; DM_SAVED_CHOICES=0 ignores them.
-// So the order is: the launch environment, the player's env.txt, the bundle's, saved choices, the host's tested defaults (docs/frontends.md, Saved choices).
+// So the order is: the launch environment, the player's env.txt, the bundle's, saved choices, this Mac's defaults by memory size (memory_defaults), the host's tested defaults
+// (docs/frontends.md, Saved choices).
 // Before the host starts, the settings window (dm/mac/Launcher.swift dm_mac_launcher, linked in by pack_app.py) runs in this process and puts the player's settings into the environment; it keeps
 // what the launch environment and the env files set (DM_ENV_LAUNCH_KEYS, DM_ENV_FILE_KEYS). DM_LAUNCHER=0 or --no-launcher (open <app> --args --no-launcher) starts the game without the window,
 // with the saved choices; so does "Show this window at launch" turned off.
@@ -162,6 +163,18 @@ static void saved_choices(void) {   // after the env files, before the bundle's 
     }
 }
 
+// Defaults by this Mac's memory size, for a variable nothing has set (the launch environment, the env files, the settings window and the saved choices come first): 8 GB or less
+// starts in the low-memory mode. The settings window sets every setting it shows, so it shows that row on by default there itself (Launcher.swift dm_mac_launcher).
+// 16 GB or less takes the three switches that cut Ocarina of Time's footprint with the picture unchanged (Kokiri Forest on an 18 GB M3 Pro: 12.4 to 10.8 GB at its peak,
+// for 0.8 ms a frame); a Mac with more memory keeps the faster defaults
+static void memory_defaults(void) {
+    static const struct { int gib; const char *env, *value; } d[] = {{8, "DM_LOWMEM", "1"}, {16, "DM_TEX_RELEASE", "1"}, {16, "DM_NVN_UPLOAD_IDLE_MS", "2000"}, {16, "DM_NVN_WINDOW_ALIAS", "1"}};
+    uint64_t mem = 0; size_t n = sizeof mem;
+    if (sysctlbyname("hw.memsize", &mem, &n, NULL, 0)) return;
+    for (size_t i = 0; i < sizeof d / sizeof *d; i++)
+        if (mem <= (uint64_t)d[i].gib << 30 && !getenv(d[i].env)) { setenv(d[i].env, d[i].value, 0); fprintf(stderr, "launcher: env %s=%s (memory size)\n", d[i].env, d[i].value); }
+}
+
 // Cloud saves: the folder chosen in the settings window (Launcher.swift CloudSavesSection, cloudSaves.folder in the app's preferences) becomes DM_SAVE_SYNC
 // (dm/host/save_sync.h), with or without the window; a DM_SAVE_SYNC the launch environment or an env file set wins. A front end may write the key too (docs/frontends.md, The cloud saves folder)
 static void cloud_saves_folder(void) {
@@ -233,6 +246,7 @@ int main(int argc, char **argv) {
     int shown = window ? dm_mac_launcher() : 2;
     if (!shown) return 0;   // Quit: no game
     if (shown == 2) saved_choices();
+    memory_defaults();
     cloud_saves_folder(); debug_logging(logs, id);
     setenv("DM_ROOT", sup, 0); setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
     snprintf(p, sizeof p, "%s/msl", res); setenv("DM_MSL_DIR", p, 0);

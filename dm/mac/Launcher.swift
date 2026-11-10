@@ -187,7 +187,10 @@ public func dmMacLauncher() -> Int32 {
         fputs("launcher: settings window off (hold Option at launch to show it)\n", stderr)
         return 2
     }
-    let model = LauncherModel(file.settings)
+    var settings = file.settings
+    // A Mac with 8 GB or less starts in the low-memory mode: that row's default here, as launcher.c memory_defaults sets it for a start without the window
+    if ProcessInfo.processInfo.physicalMemory <= 8 << 30, let i = settings.firstIndex(where: { $0.env == "DM_LOWMEM" }) { settings[i].def = "1" }
+    let model = LauncherModel(settings)
     let app = NSApplication.shared, launcher = Launcher(model)
     app.setActivationPolicy(.regular)
     app.delegate = launcher

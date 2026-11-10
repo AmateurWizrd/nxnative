@@ -641,6 +641,20 @@ class App(unittest.TestCase):
         self.assertIn('standin host output', (logs / f'{TID}.prev.log').read_text())
         self.assertEqual(self.host_run()['DM_LANG'], 'fr')   # Info.plist DMLanguage
 
+    def test_memory_size_defaults(self):   # 8 GB or less: the low-memory mode; 16 GB or less: the footprint switches; unless something set the variable. Each Mac runs its own side
+        mem = int(subprocess.run(['/usr/sbin/sysctl', '-n', 'hw.memsize'], capture_output=True, text=True, check=True).stdout)
+        sets = {'DM_LOWMEM': ('1', 8), 'DM_TEX_RELEASE': ('1', 16), 'DM_NVN_UPLOAD_IDLE_MS': ('2000', 16), 'DM_NVN_WINDOW_ALIAS': ('1', 16)}
+        logs = self.tmp / 'home/Library/Logs/nxnative'
+        p = self.launch(); p.communicate(timeout=30)
+        r, log = self.host_run(), (logs / f'{TID}.log').read_text()
+        for env, (value, gib) in sets.items():
+            with self.subTest(env=env):
+                self.assertEqual(r.get(env), value if mem <= gib << 30 else None)
+                self.assertEqual(f'launcher: env {env}={value} (memory size)' in log, mem <= gib << 30)
+        p = self.launch(**{env: '0' for env in sets}); p.communicate(timeout=30)
+        self.assertEqual({env: self.host_run()[env] for env in sets}, {env: '0' for env in sets})
+        self.assertNotIn('(memory size)', (logs / f'{TID}.log').read_text())
+
     def test_sigterm(self):   # forwarded to the host, whose exit code comes back
         p = self.launch(wait=True)
         for _ in range(100):

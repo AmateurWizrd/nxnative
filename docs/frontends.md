@@ -73,7 +73,8 @@ Each app keeps the player's choices in its own preferences domain, its bundle ID
   2. the player's `env.txt` (`~/Library/Application Support/nxnative/<title ID>/env.txt`; on the iPhone, `Documents/env.txt`);
   3. the bundle's `dm/env.txt`;
   4. saved choices;
-  5. the tested defaults (the host's own, from the game's profile).
+  5. on the Mac, the launcher's defaults by memory size (`DM_LOWMEM=1` with 8 GB or less, where the settings window shows that row on by default; `DM_TEX_RELEASE=1`, `DM_NVN_UPLOAD_IDLE_MS=2000` and `DM_NVN_WINDOW_ALIAS=1` with 16 GB or less);
+  6. the tested defaults (the host's own, from the game's profile).
 - **Launch overrides are temporary.** A front end that starts the game with a variable in its environment overrides the saved choice for that start only. It writes the store only when the player means to keep the choice.
 - **`DM_SAVED_CHOICES=0`** (in the environment or an `env.txt`) starts with the tested defaults and leaves the saved choices as they are. **`DM_LAUNCHER=0`** only skips the settings screen (the iPhone's, or a Mac app's window): the saved choices still apply.
 - **A sandboxed front end** cannot write another app's preferences domain; this store is for front ends outside the App Sandbox, as NX2Apple is.
