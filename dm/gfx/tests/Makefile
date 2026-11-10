@@ -249,6 +249,9 @@ t_kk12: t_kk12.m $(MTL_T_DEP)
 check_t_kk12: t_kk12
 	DM_NVN_KK12=1 MTL_DEBUG_LAYER=1 ./t_kk12
 	MTL_DEBUG_LAYER=1 ./t_kk12
+t_tg_guard: t_tg_guard.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_tg_guard.m $(MTL_T_SRC) $(FW)
+check_t_tg_guard: RUN_ENV = MTL_DEBUG_LAYER=1
 t_dispatch_own: t_dispatch_own.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_own.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_dispatch_own
