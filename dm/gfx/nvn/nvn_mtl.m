@@ -1836,9 +1836,10 @@ static void img_fit_upgrade(void); static int g_imfit_npend;   // textures an im
 // a Metal System Trace on an M1 showed vertex work starting under the previous pass's fragments 135 times in 10,000 pass changes, about 4.6 ms a frame of GPU idle in that seam.
 // Aliased storage is still ordered: a pass's attachments are loaded and stored in its fragment stage, which the relaxed end barrier orders after the previous pass's vertex and
 // fragment stages, and that barrier carries resource_vis() (the alias flush while a heap is alive); encoders other than draw passes keep their full barriers. What changes is what
-// the relaxed path always allowed, a vertex stage overlapping the previous pass's fragments, ordered by the game's own barriers. DM_NVN_BARRIER_HEAP=0 restores the full barriers
+// the relaxed path always allowed, a vertex stage overlapping the previous pass's fragments, ordered by the game's own barriers. Off by default: DM_NVN_BARRIER_HEAP=1 turns it on.
+// Ocarina of Time's Kokiri Forest on an M3 Pro, GPU-bound at full resolution, gained no frame time from it (21.8 ms a frame either way) and its GPU time rose from 20.1 to 21.4 ms
 static int g_end_heap;   // the last draw pass ended with the full barrier only because image heaps were alive (draw-pass full barriers line)
-static int bar_heap_ok(void) { static int m = -1; if (m < 0) { const char *e = getenv("DM_NVN_BARRIER_HEAP"); m = !(e && !strcmp(e, "0")); if (!m) MLOG("DM_NVN_BARRIER_HEAP=0: while image heaps are alive, draw passes end and begin with full barriers"); } return m || !g_image_heap_n; }
+static int bar_heap_ok(void) { static int m = -1; if (m < 0) { const char *e = getenv("DM_NVN_BARRIER_HEAP"); m = e && !strcmp(e, "1"); if (m) MLOG("DM_NVN_BARRIER_HEAP=1: while image heaps are alive, draw passes take the relaxed end barrier too"); } return m || !g_image_heap_n; }
 static int g_last_end_relaxed, g_game_barrier, g_game_bar_bits;   // the last encoder ended was a draw pass with the relaxed end barrier (nothing else since); the game issued nvnCommandBufferBarrier since the last draw pass began
 // Whether the game's barriers since the last draw pass began need the next pass's full barrier: any but the fragment-ordering ones (bar_frag_only, which PR #1970's bar_game_full
 // repeats with a wider rule; this tree keeps its own)
